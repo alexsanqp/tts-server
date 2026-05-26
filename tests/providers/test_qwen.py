@@ -221,7 +221,7 @@ async def test_describe_returns_static_capabilities(tmp_path) -> None:
 async def test_describe_scans_ref_audio_dir_for_voices(tmp_path) -> None:
     # Create dummy ref clips. Bytes don't matter — we only inspect the catalog.
     (tmp_path / "en.mp3").write_bytes(b"\x00")
-    (tmp_path / "uk.wav").write_bytes(b"\x00")
+    (tmp_path / "uk.wav").write_bytes(b"\x00")  # Ukrainian: not in QWEN_LANGUAGES, must be filtered out.
     (tmp_path / "de.wav").write_bytes(b"\x00")
     (tmp_path / "notes.txt").write_text("ignored")
 
@@ -231,7 +231,10 @@ async def test_describe_scans_ref_audio_dir_for_voices(tmp_path) -> None:
         caps = await provider.describe()
 
     voice_ids = {v.id for v in caps.voices}
-    assert voice_ids == {"ref:en-default", "ref:uk-default", "ref:de-default"}
+    # uk.wav exists in the catalog dir but Qwen doesn't speak Ukrainian, so
+    # _scan_voices filters it. Advertising it would be a lie — synthesis with
+    # language=uk lands on the worker's UNSUPPORTED_LANGS check and 400s.
+    assert voice_ids == {"ref:en-default", "ref:de-default"}
 
     by_id = {v.id: v for v in caps.voices}
     en = by_id["ref:en-default"]

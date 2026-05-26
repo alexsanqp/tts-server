@@ -117,9 +117,13 @@ class QwenProvider:
         return any(v.id == voice_id for v in self._scan_voices())
 
     def _scan_voices(self) -> tuple[VoiceInfo, ...]:
-        """Inventory <ref_audio_dir>/*.{wav,mp3}.
+        """Inventory <ref_audio_dir>/*.{wav,mp3} restricted to Qwen-supported languages.
 
         Each `<stem>.<ext>` becomes a VoiceInfo with id `ref:<stem>-default`.
+        Stems whose primary tag is not in :data:`QWEN_LANGUAGES` are skipped —
+        advertising e.g. `ref:uk-default` for Qwen would be misleading because
+        the worker rejects synthesis with HTTP 400. Drop those audio files
+        into the catalog for OTHER providers that may use them later.
         Returns an empty tuple if the directory is missing or empty.
         """
         ref_dir = self._ref_audio_dir
@@ -136,14 +140,17 @@ class QwenProvider:
 
         voices: list[VoiceInfo] = []
         for stem, _path in sorted(seen.items()):
+            primary = stem.lower()
+            if primary not in QWEN_LANGUAGES:
+                continue  # Qwen can't synthesize this language; don't advertise.
             metadata: dict[str, str] = {}
-            ref_text = REF_TEXTS.get(stem.lower())
+            ref_text = REF_TEXTS.get(primary)
             if ref_text:
                 metadata["ref_text"] = ref_text
             voices.append(
                 VoiceInfo(
                     id=f"ref:{stem}-default",
-                    languages=(stem.lower(),),
+                    languages=(primary,),
                     accepts_voice_id=False,
                     accepts_clone_ref=True,
                     metadata=metadata,
