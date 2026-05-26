@@ -12,7 +12,7 @@ import logging
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 
-from tts_server.core.auth import require_bearer_token
+from tts_server.core.auth import optional_bearer_token, require_bearer_token
 from tts_server.core.refs import RefStore, RefStoreError
 
 logger = logging.getLogger(__name__)
@@ -88,8 +88,13 @@ async def upload_ref(request: Request, file: UploadFile = File(...)) -> dict:
     }
 
 
-@router.get("/refs/catalog")
+@router.get("/refs/catalog", dependencies=[Depends(optional_bearer_token)])
 async def list_catalog(request: Request) -> dict:
-    """Read-only listing of the baked-in ref catalog (no upload TTL)."""
+    """Read-only listing of the baked-in ref catalog (no upload TTL).
+
+    Gated by :func:`optional_bearer_token` so that when an operator
+    configures ``auth_token`` the catalog ids are locked down alongside
+    synthesis — listing them without auth would leak voice inventory.
+    """
     ref_store: RefStore = request.app.state.ref_store
     return {"ids": ref_store.catalog_ids()}

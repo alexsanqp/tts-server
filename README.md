@@ -147,16 +147,30 @@ curl -X POST 'http://localhost:8880/v1/audio/speech?envelope=json' \
 
 ## API reference
 
-| Method | Path                  | Purpose                                                    |
-|--------|-----------------------|------------------------------------------------------------|
-| `POST` | `/v1/audio/speech`    | Synthesize text → audio. Add `?envelope=json` for JSON.    |
-| `GET`  | `/v1/models`          | List enabled providers, languages, voice-listing URLs.     |
-| `GET`  | `/v1/voices`          | Voice catalog. Filter with `?model=` and `?language=`.     |
-| `POST` | `/v1/refs`            | Upload reference audio for voice cloning. **Auth required.** |
-| `GET`  | `/v1/refs/catalog`    | List baked-in reference voices.                            |
-| `GET`  | `/v1/route`           | Preview routing for `?language=&model=auto`.               |
-| `GET`  | `/healthz`            | Liveness.                                                  |
-| `GET`  | `/readyz`             | Readiness — 503 if a required provider failed to load.     |
+| Method | Path                  | Auth     | Purpose                                                    |
+|--------|-----------------------|----------|------------------------------------------------------------|
+| `POST` | `/v1/audio/speech`    | optional | Synthesize text → audio. Add `?envelope=json` for JSON.    |
+| `GET`  | `/v1/models`          | optional | List enabled providers, languages, voice-listing URLs.     |
+| `GET`  | `/v1/voices`          | optional | Voice catalog. Filter with `?model=` and `?language=`.     |
+| `POST` | `/v1/refs`            | required | Upload reference audio for voice cloning.                  |
+| `GET`  | `/v1/refs/catalog`    | optional | List baked-in reference voices.                            |
+| `GET`  | `/v1/route`           | optional | Preview routing for `?language=&model=auto`.               |
+| `GET`  | `/healthz`            | none     | Liveness — always anonymous (LB convention).               |
+| `GET`  | `/readyz`             | none     | Readiness — 503 if a required provider failed to load.     |
+
+**Auth column legend:**
+
+* **`optional`** — anonymous when `server.auth_token` is empty (intra-LAN
+  dev). The moment a token is configured, the endpoint is **enforced** —
+  no exceptions for read endpoints, otherwise the routing/voice catalog
+  would leak even though synthesis is protected.
+* **`required`** — `/v1/refs` is the only write surface and ALWAYS
+  rejects anonymous access. If `auth_token` is empty, the endpoint
+  returns 403 `auth_not_configured` (intentional: empty token is not
+  "anonymous uploads allowed").
+* **`none`** — `/healthz` and `/readyz` never check auth, so load
+  balancers and container orchestrators can probe them without
+  credentials.
 
 ### `POST /v1/audio/speech` — request body
 

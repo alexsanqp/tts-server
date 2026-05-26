@@ -1,16 +1,24 @@
-"""GET /v1/models, GET /v1/voices — capability introspection."""
+"""GET /v1/models, GET /v1/voices — capability introspection.
+
+Both endpoints gate behind :func:`optional_bearer_token`: when the
+server runs without a configured token they're fully public (intra-LAN
+dev), but the moment an operator sets one, the introspection surface is
+locked down too — otherwise the routing/voice catalog leaks even though
+synthesis itself requires the token.
+"""
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 
+from tts_server.core.auth import optional_bearer_token
 from tts_server.core.probing import voice_available
 from tts_server.core.registry import ProviderRegistry
 
 router = APIRouter(tags=["models"])
 
 
-@router.get("/models")
+@router.get("/models", dependencies=[Depends(optional_bearer_token)])
 async def list_models(request: Request) -> dict:
     registry: ProviderRegistry = request.app.state.registry
     items = []
@@ -34,7 +42,7 @@ async def list_models(request: Request) -> dict:
     return {"models": items}
 
 
-@router.get("/voices")
+@router.get("/voices", dependencies=[Depends(optional_bearer_token)])
 async def list_voices(
     request: Request,
     model: str | None = None,

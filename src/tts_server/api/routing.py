@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 
+from tts_server.core.auth import optional_bearer_token
 from tts_server.core.errors import UnknownModel
 from tts_server.core.registry import ProviderRegistry
 from tts_server.settings import Settings
@@ -35,7 +36,7 @@ def resolve_model(settings: Settings, registry: ProviderRegistry, *, model: str,
     return default, "default"
 
 
-@router.get("/route")
+@router.get("/route", dependencies=[Depends(optional_bearer_token)])
 async def preview_route(request: Request, language: str = "", model: str = "auto") -> dict:
     settings: Settings = request.app.state.settings
     registry: ProviderRegistry = request.app.state.registry

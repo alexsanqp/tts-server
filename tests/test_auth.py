@@ -50,6 +50,49 @@ def test_speech_works_with_correct_token(client_authed) -> None:
     assert r.status_code == 200
 
 
+@pytest.mark.parametrize(
+    "path",
+    ["/v1/models", "/v1/voices", "/v1/refs/catalog", "/v1/route?language=en"],
+)
+def test_read_endpoints_require_token_when_configured(client_authed, path: str) -> None:
+    """When auth_token is set, the read surface (models/voices/catalog/route)
+    is also locked down — otherwise the voice/routing catalog leaks even
+    though synthesis itself is protected."""
+    r = client_authed.get(path)
+    assert r.status_code == 401, (path, r.text)
+    body = r.json()
+    assert body["detail"]["error"]["code"] == "unauthorized"
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/v1/models", "/v1/voices", "/v1/refs/catalog", "/v1/route?language=en"],
+)
+def test_read_endpoints_pass_with_correct_token(client_authed, path: str) -> None:
+    r = client_authed.get(path, headers={"Authorization": "Bearer secret"})
+    assert r.status_code == 200, (path, r.text)
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/v1/models", "/v1/voices", "/v1/refs/catalog", "/v1/route?language=en"],
+)
+def test_read_endpoints_anonymous_when_no_token_configured(client, path: str) -> None:
+    """Default config has empty auth_token → read endpoints stay anonymous."""
+    r = client.get(path)
+    assert r.status_code == 200, (path, r.text)
+
+
+def test_healthz_and_readyz_never_require_auth(client_authed) -> None:
+    """Health checks must stay anonymous even with a token configured —
+    load balancers and orchestrators don't carry bearer credentials."""
+    assert client_authed.get("/healthz").status_code == 200
+    # /readyz may be 200 or 503 depending on required-provider state;
+    # the point here is that auth doesn't gate it.
+    r = client_authed.get("/readyz")
+    assert r.status_code in (200, 503)
+
+
 def test_refs_upload_requires_auth_even_without_token_configured(client) -> None:
     """When auth_token is empty, /v1/refs MUST still 403 (write surface)."""
     r = client.post("/v1/refs", files={"file": ("x.wav", b"fake-content", "audio/wav")})
