@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import ipaddress
 import json
 import logging
 import os
@@ -32,31 +33,24 @@ from typing import Any
 import httpx
 
 from tts_server.core.errors import ProviderFailure, ProviderUnavailable
+from tts_server.core.wav import wav_duration_ms as _wav_duration_ms
 from tts_server.providers.base import (
     ProviderCapabilities,
     SynthesisRequest,
     SynthesisStream,
     VoiceInfo,
 )
+from tts_server.providers.qwen_constants import QWEN_LANGUAGES, REF_TEXTS
 
 logger = logging.getLogger(__name__)
 
 
-# Legacy fallback texts for plain-stem ref clips (e.g. en.mp3 → ref:en-default).
-# New deployments use <lang>-<name>.{mp3,wav} + <lang>-<name>.json sidecars
-# (see :meth:`QwenProvider._scan_voices`). Kept here so existing single-file
-# catalogs without a sidecar still expose a usable ref_text.
-REF_TEXTS: dict[str, str] = {
-    "en": (
-        "Hello, my name is your English teacher. "
-        "Today we will learn new vocabulary words together."
-    ),
-}
-
-# Qwen3-TTS supported BCP-47 primary tags (mirrored from worker LANG_MAP).
-QWEN_LANGUAGES: tuple[str, ...] = (
-    "en", "de", "fr", "it", "es", "ru", "ja", "ko", "zh", "pt",
-)
+# Re-exported for tests that already imported these symbols from this module.
+__all__ = [
+    "QWEN_LANGUAGES",
+    "QwenProvider",
+    "REF_TEXTS",
+]
 
 # Per-variant defaults for QwenProvider. The provider_id is set by the
 # registry (one factory row per id in BUILTIN_PROVIDERS), which lets us
@@ -97,6 +91,7 @@ class QwenProvider:
 
         self._port: int = int(opts.get("port", variant["port"]))
         self._host: str = str(opts.get("host", "127.0.0.1"))
+        _warn_if_sidecar_host_is_reachable(self._host, self._provider_id)
         self._ref_audio_dir: Path = Path(
             opts.get("ref_audio_dir", "data/refs-catalog")
         )
@@ -254,6 +249,12 @@ class QwenProvider:
         else:
             env["CUDA_VISIBLE_DEVICES"] = device
 
+        # Soft VRAM check before we burn 30-120 s loading: if nvidia-smi
+        # is reachable and reports less free VRAM than the variant typically
+        # needs, log a warning. We never refuse — operators on AMD/CPU/etc
+        # just see no warning at all.
+        _warn_if_low_vram(self._model_name)
+
         logger.info(
             "Spawning Qwen sidecar: %s (model=%s, device=%s, log=%s)",
             " ".join(cmd), self._model_name, self._device, self._log_path,
@@ -283,7 +284,7 @@ class QwenProvider:
 
     async def _wait_until_ready(self) -> None:
         """Poll /health every 2 s until model_loaded=True or timeout."""
-        deadline = asyncio.get_event_loop().time() + self._startup_timeout
+        deadline = asyncio.get_running_loop().time() + self._startup_timeout
         last_error: str = "no response"
 
         async with httpx.AsyncClient(timeout=5.0) as client:
@@ -317,7 +318,7 @@ class QwenProvider:
                     else:
                         last_error = f"HTTP {resp.status_code}"
 
-                if asyncio.get_event_loop().time() >= deadline:
+                if asyncio.get_running_loop().time() >= deadline:
                     # Best-effort cleanup of the still-loading subprocess.
                     await self._terminate_proc()
                     raise ProviderUnavailable(
@@ -358,7 +359,7 @@ class QwenProvider:
         if proc.poll() is not None:
             return  # already exited
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         try:
             proc.terminate()
         except OSError as exc:
@@ -379,16 +380,10 @@ class QwenProvider:
             except subprocess.TimeoutExpired:
                 logger.error("Qwen sidecar refused to die after SIGKILL")
 
-    def __del__(self) -> None:  # best-effort GC cleanup
-        proc = getattr(self, "_proc", None)
-        if proc is None:
-            return
-        try:
-            if proc.poll() is None:
-                proc.terminate()
-        except Exception:
-            # __del__ must never raise.
-            pass
+    # NOTE: no __del__ — `teardown()` is the supported cleanup path. A GC
+    # hook that calls `proc.terminate()` is unsafe in asyncio (no running
+    # loop guaranteed) and Windows-fragile, and the registry already
+    # awaits `teardown()` on shutdown.
 
     # ---- synthesize ----
 
@@ -443,6 +438,101 @@ class QwenProvider:
         return f"http://{self._host}:{self._port}/health"
 
 
+# Variant → expected peak free VRAM (MiB). Used only for the warning in
+# `_warn_if_low_vram`; nothing enforces this, the actual cap is what the
+# GPU + driver hand us.
+_EXPECTED_VRAM_MIB: dict[str, int] = {
+    "0.6B": 4000,
+    "1.7B": 6500,
+}
+
+
+def _warn_if_sidecar_host_is_reachable(host: str, provider_id: str) -> None:
+    """Log a warning if the sidecar host is not loopback.
+
+    The sidecar's HTTP API has no auth (it trusts the parent process), so
+    binding it to 0.0.0.0 or any routable address exposes unauthenticated
+    GPU synthesis to the LAN. Operators sometimes set this by mistake when
+    copying the [server] block's `host` into the provider block. We warn
+    rather than reject so an operator with deliberate network setup (e.g.
+    multi-host GPU pool) can still proceed.
+    """
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        # Hostnames — only "localhost" is safely loopback. Other names may
+        # resolve anywhere; flag and move on.
+        if host.lower() != "localhost":
+            logger.warning(
+                "Qwen sidecar %r host=%r is a hostname (not a loopback address). "
+                "Make sure it resolves to 127.0.0.1 or set host='127.0.0.1' "
+                "explicitly — the sidecar has no auth and will accept any caller.",
+                provider_id, host,
+            )
+        return
+    if not ip.is_loopback:
+        logger.warning(
+            "Qwen sidecar %r host=%s is not a loopback address. The sidecar "
+            "has no auth and will accept any caller. Set host='127.0.0.1' "
+            "in [providers.%s] unless you've put your own network ACL in "
+            "front of it.",
+            provider_id, host, provider_id,
+        )
+
+
+def _check_free_vram_mib(device: str) -> int | None:
+    """Return free VRAM in MiB on the CUDA device, or None when unavailable.
+
+    Uses `nvidia-smi` rather than importing torch — keeping the proxy
+    process lean. Non-NVIDIA hosts, missing driver, or any other failure
+    silently returns None and the caller falls back to "I don't know".
+    """
+    if not device.startswith("cuda"):
+        return None
+    # Broad except: VRAM check is purely informational. nvidia-smi missing,
+    # mocked subprocess in tests, malformed output, driver issues — all
+    # mean "I can't tell" and the caller should silently skip the warning.
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.free",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return None
+        line = (result.stdout or "").strip().splitlines()
+        if not line:
+            return None
+        return int(line[0].strip())
+    except Exception:  # noqa: BLE001 — informational fast-path, never raises
+        return None
+
+
+def _warn_if_low_vram(model_name: str) -> None:
+    """Log a warning when free VRAM looks tight for this Qwen variant."""
+    expected: int | None = None
+    for tag, mib in _EXPECTED_VRAM_MIB.items():
+        if tag in model_name:
+            expected = mib
+            break
+    if expected is None:
+        return
+    free = _check_free_vram_mib("cuda:0")
+    if free is None:
+        return
+    if free < expected:
+        logger.warning(
+            "Free VRAM (%d MiB) is below the typical peak for %s (~%d MiB). "
+            "Load may OOM — close other GPU processes or use the smaller variant.",
+            free, model_name, expected,
+        )
+
+
 def _parse_sample_rate(headers: httpx.Headers, audio: bytes) -> int:
     """Prefer the worker's X-Sample-Rate header; fall back to parsing the WAV."""
     hdr = headers.get("x-sample-rate") if headers else None
@@ -456,17 +546,6 @@ def _parse_sample_rate(headers: httpx.Headers, audio: bytes) -> int:
             return wf.getframerate()
     except (wave.Error, EOFError):
         return 24000
-
-
-def _wav_duration_ms(audio: bytes) -> int:
-    """Compute duration from WAV header. Returns 0 if not parseable."""
-    try:
-        with wave.open(io.BytesIO(audio), "rb") as wf:
-            frames = wf.getnframes()
-            rate = wf.getframerate() or 1
-            return int(round(frames * 1000 / rate))
-    except (wave.Error, EOFError):
-        return 0
 
 
 _ALLOWED_SIDECAR_KEYS = ("description", "role")

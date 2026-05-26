@@ -7,6 +7,7 @@ returns 422 with a clear error so clients know to either ask for the
 native format or install ffmpeg.
 
 Kept deliberately small — no streaming, no chunking, in-memory only.
+The WAV header repair (after ffmpeg) lives in :mod:`tts_server.core.wav`.
 """
 
 from __future__ import annotations
@@ -15,6 +16,8 @@ import asyncio
 import logging
 import shutil
 from dataclasses import dataclass
+
+from tts_server.core.wav import normalize_wav
 
 logger = logging.getLogger(__name__)
 
@@ -104,55 +107,14 @@ async def transcode(
     if not out:
         raise TranscoderError("ffmpeg produced empty output")
 
-    # ffmpeg writing WAV to pipe:1 can't seek back to patch the RIFF/data
-    # chunk sizes, so they're left as 0xFFFFFFFF placeholders, and an extra
-    # LIST/INFO metadata chunk gets inserted between `fmt ` and `data`.
-    # Strict parsers (e.g. Python's stdlib :mod:`wave`) then either reject
-    # the file or read garbage. Repair the header in-place.
+    # ffmpeg writing WAV to pipe:1 leaves 0xFFFFFFFF size placeholders and
+    # extra metadata chunks; :func:`normalize_wav` walks the bytes and
+    # rebuilds a clean header strict parsers (Python's `wave`) accept.
     if tgt == "wav":
-        out = _normalize_wav(out)
+        out = normalize_wav(out)
 
     return TranscodeResult(audio=out, sample_rate=target_sample_rate or 0)
 
 
-def _normalize_wav(data: bytes) -> bytes:
-    """Repair a WAV produced by piped ffmpeg.
-
-    Keeps only the ``fmt `` and ``data`` chunks (drops LIST, JUNK, INFO,
-    etc.) and rewrites the RIFF + data chunk sizes from the actual byte
-    counts. Returns ``data`` unchanged if it doesn't look like a WAV —
-    silent no-op rather than corrupting unknown payloads.
-    """
-    if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
-        return data
-
-    fmt_chunk = b""
-    audio_payload = b""
-    pos = 12
-    n = len(data)
-    while pos + 8 <= n:
-        chunk_id = data[pos:pos + 4]
-        chunk_size = int.from_bytes(data[pos + 4:pos + 8], "little")
-        body_start = pos + 8
-        body_end = body_start + chunk_size
-        if chunk_id == b"fmt ":
-            # Keep the chunk header + its body verbatim.
-            fmt_chunk = data[pos:body_end]
-        elif chunk_id == b"data":
-            # In pipe mode `chunk_size` may be the 0xFFFFFFFF placeholder,
-            # so trust the actual file bytes instead.
-            audio_payload = data[body_start:]
-            break
-        # else: skip non-essential chunks.
-        pos = body_end
-        # WAV chunks pad to 2-byte alignment.
-        if pos & 1:
-            pos += 1
-
-    if not fmt_chunk or not audio_payload:
-        return data  # malformed → don't touch
-
-    data_chunk = b"data" + len(audio_payload).to_bytes(4, "little") + audio_payload
-    body = b"WAVE" + fmt_chunk + data_chunk
-    riff_size = len(body).to_bytes(4, "little")
-    return b"RIFF" + riff_size + body
+# Back-compat alias: existing tests import ``_normalize_wav`` from this module.
+_normalize_wav = normalize_wav

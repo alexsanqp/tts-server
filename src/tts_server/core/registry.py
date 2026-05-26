@@ -1,14 +1,26 @@
 """Provider registry — single source of truth for enabled providers.
 
-v1: providers are registered in `BUILTIN_PROVIDERS` below. Entry-point
-discovery is deferred to v2 — for three built-in providers it's overkill.
+v1: providers are registered in :data:`BUILTIN_PROVIDERS` below. Entry-point
+discovery is deferred to v2 — for a handful of built-in providers it's
+overkill.
+
+Each table row is a :class:`ProviderSpec` carrying:
+
+* ``factory`` — either a class (instantiated with no args) or a callable
+  taking the merged options dict.
+* ``defaults`` — table-level defaults for that row's options. Used to
+  pin per-row state without leaking it into every config file: e.g. both
+  Qwen variants share :class:`tts_server.providers.qwen.QwenProvider`
+  and only differ by ``provider_id`` (which the class then maps to the
+  HF checkpoint and sidecar port). User-supplied options from TOML/env
+  override these defaults.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -21,19 +33,16 @@ from tts_server.settings import Settings
 logger = logging.getLogger(__name__)
 
 
-# Built-in providers. To add one: implement TTSProvider Protocol, add a row here.
-# Each value is a zero-arg factory (or a callable taking the options dict).
-BUILTIN_PROVIDERS: dict[str, Any] = {
-    "fake": FakeProvider,
-    "edge": lambda opts: _lazy_import("tts_server.providers.edge", "EdgeProvider")(opts),
-    # Two Qwen variants share the same provider class; provider_id (injected
-    # below in startup()) selects the HF checkpoint and sidecar port.
-    "qwen3-0.6b": lambda opts: _lazy_import("tts_server.providers.qwen", "QwenProvider")(opts),
-    "qwen3-1.7b": lambda opts: _lazy_import("tts_server.providers.qwen", "QwenProvider")(opts),
-    "styletts2-uk": lambda opts: _lazy_import(
-        "tts_server.providers.styletts2_uk", "StyleTTS2UkProvider"
-    )(opts),
-}
+@dataclass(frozen=True)
+class ProviderSpec:
+    """Recipe for instantiating a registered provider.
+
+    ``defaults`` is merged with the per-provider TOML options before
+    being handed to ``factory``; explicit config wins over defaults.
+    """
+
+    factory: Any  # class or Callable[[dict], TTSProvider]
+    defaults: dict[str, Any] = field(default_factory=dict)
 
 
 def _lazy_import(module: str, attr: str):
@@ -41,6 +50,31 @@ def _lazy_import(module: str, attr: str):
 
     mod = importlib.import_module(module)
     return getattr(mod, attr)
+
+
+def _qwen_factory(opts: dict[str, Any]):
+    return _lazy_import("tts_server.providers.qwen", "QwenProvider")(opts)
+
+
+def _edge_factory(opts: dict[str, Any]):
+    return _lazy_import("tts_server.providers.edge", "EdgeProvider")(opts)
+
+
+def _styletts2_uk_factory(opts: dict[str, Any]):
+    return _lazy_import("tts_server.providers.styletts2_uk", "StyleTTS2UkProvider")(opts)
+
+
+# Built-in providers. To add one: implement the TTSProvider Protocol and
+# add a row here. ``defaults`` is for row-level pinning (e.g. selecting
+# a model variant), not for runtime configuration — put runtime knobs
+# under ``[providers.<id>]`` in TOML instead.
+BUILTIN_PROVIDERS: dict[str, ProviderSpec] = {
+    "fake": ProviderSpec(FakeProvider),
+    "edge": ProviderSpec(_edge_factory),
+    "qwen3-0.6b": ProviderSpec(_qwen_factory, defaults={"provider_id": "qwen3-0.6b"}),
+    "qwen3-1.7b": ProviderSpec(_qwen_factory, defaults={"provider_id": "qwen3-1.7b"}),
+    "styletts2-uk": ProviderSpec(_styletts2_uk_factory),
+}
 
 
 @dataclass
@@ -67,19 +101,26 @@ class ProviderRegistry:
     async def startup(self) -> None:
         """Instantiate enabled providers; eagerly call describe()."""
         for provider_id in self._settings.providers.enabled:
-            factory = BUILTIN_PROVIDERS.get(provider_id)
-            if factory is None:
+            spec = BUILTIN_PROVIDERS.get(provider_id)
+            if spec is None:
                 logger.warning("Provider %r is enabled in config but not registered; skipping.", provider_id)
                 continue
 
-            # Inject the registered id so providers that back multiple
-            # config keys (e.g. qwen3-0.6b vs qwen3-1.7b) can self-identify.
-            # Unknown to providers that don't read it — they ignore extra
-            # keys via opts.get() lookups.
-            opts = dict(self._settings.providers.provider_options(provider_id))
-            opts.setdefault("provider_id", provider_id)
+            # Merge order: spec defaults < TOML options < canonical provider_id.
+            # Canonical id last so an accidental [providers.qwen3-0.6b]
+            # provider_id="something_else" can never lie about which row
+            # the registry is actually serving.
+            opts = {
+                **spec.defaults,
+                **self._settings.providers.provider_options(provider_id),
+                "provider_id": provider_id,
+            }
             try:
-                instance = factory(opts) if _factory_takes_arg(factory) else factory()
+                instance = (
+                    spec.factory(opts)
+                    if _factory_takes_arg(spec.factory)
+                    else spec.factory()
+                )
             except Exception as exc:
                 logger.exception("Failed to instantiate provider %r: %s", provider_id, exc)
                 if provider_id in self._settings.providers.required:
@@ -87,7 +128,10 @@ class ProviderRegistry:
                 continue
 
             caps = await instance.describe()
-            concurrency_limit = int(opts.get("concurrency", 1 if caps.is_gpu else 16))
+            opts_for_concurrency = self._settings.providers.provider_options(provider_id)
+            concurrency_limit = int(
+                opts_for_concurrency.get("concurrency", 1 if caps.is_gpu else 16)
+            )
             entry = ProviderEntry(
                 id=provider_id,
                 instance=instance,

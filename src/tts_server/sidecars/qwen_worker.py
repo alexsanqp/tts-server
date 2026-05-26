@@ -35,39 +35,16 @@ import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from tts_server.providers.qwen_constants import (  # noqa: E402 — kept after stdlib imports
+    LANG_MAP,
+    REF_TEXTS,
+    UNSUPPORTED_LANGS,
+)
+
 logger = logging.getLogger(__name__)
 
 _model = None
 _ref_audio_cache: dict[str, str] = {}  # primary lang tag -> ref audio path
-
-
-# Qwen3-TTS supported language tags + human-readable name expected by the model.
-LANG_MAP = {
-    "en": "English",
-    "de": "German",
-    "fr": "French",
-    "es": "Spanish",
-    "ru": "Russian",
-    "ja": "Japanese",
-    "ko": "Korean",
-    "zh": "Chinese",
-    "pt": "Portuguese",
-    "it": "Italian",
-}
-
-# Languages NOT supported by Qwen3-TTS. Returned as 400 so the caller can
-# route elsewhere (e.g. lingua-pairs uses edge-tts for uk).
-UNSUPPORTED_LANGS = frozenset({"uk", "pl", "ar", "hi", "tr", "nl", "sv", "no", "fi", "da"})
-
-# Curated reference texts for the baked-in ref clips. **Must** stay in sync
-# with `tts_server/providers/qwen.py:REF_TEXTS` (it's mirrored there so the
-# proxy's describe() doesn't need to import this worker module).
-REF_TEXTS = {
-    "en": (
-        "Hello, my name is your English teacher. "
-        "Today we will learn new vocabulary words together."
-    ),
-}
 
 
 def _load_model():
