@@ -28,6 +28,11 @@ logger = logging.getLogger(__name__)
 # weirdness (NTFS alternate data streams, NUL bytes, leading dots, etc.).
 _SAFE_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
+# Named catalog voice: <lang>-<voice_name>, e.g. "en-owen", "ja-akari".
+# Resolves to <catalog_dir>/<lang>-<name>.<ext>. Sidecar JSON lives at
+# the same stem (handled by provider code, not RefStore).
+_NAMED_REF_RE = re.compile(r"^([a-z]{2,3})-([a-z0-9][a-z0-9_-]{0,30})$")
+
 _ALLOWED_EXTS = {".wav", ".mp3", ".flac", ".ogg"}
 _MIME_TO_EXT = {
     "audio/wav": ".wav",
@@ -71,6 +76,16 @@ class RefStore:
     # ---- catalog ids ----
 
     def catalog_ids(self) -> list[str]:
+        """List ref ids backed by audio files in the catalog directory.
+
+        Two stem patterns are recognised:
+
+        * ``<lang>`` (e.g. ``en.mp3``)             → ``ref:<lang>-default``
+        * ``<lang>-<name>`` (e.g. ``en-owen.mp3``) → ``ref:<lang>-<name>``
+
+        Anything else is skipped silently. Dedup'd by stem so en.mp3 + en.wav
+        don't both appear.
+        """
         if not self.catalog_dir.is_dir():
             return []
         ids = []
@@ -81,35 +96,40 @@ class RefStore:
             stem = path.stem.lower()
             if stem in seen:
                 continue
+            if _NAMED_REF_RE.match(stem):
+                ids.append(f"ref:{stem}")
+            elif _SAFE_SLUG_RE.match(stem):
+                ids.append(f"ref:{stem}-default")
+            else:
+                continue
             seen.add(stem)
-            ids.append(f"ref:{stem}-default")
         return ids
 
     # ---- resolve ----
 
     def resolve(self, ref_id: str) -> Path | None:
-        """Return absolute Path for a ref_id or None if not found."""
+        """Return absolute Path for a ref_id or None if not found.
+
+        Recognised forms:
+
+        * ``ref:<lang>-default``  → ``<catalog>/<lang>.<ext>``
+        * ``ref:<lang>-<name>``   → ``<catalog>/<lang>-<name>.<ext>``
+        * ``ref:<hex12+>``        → ``<upload>/<full_sha256>.<ext>``
+        """
         if not ref_id.startswith("ref:"):
             return None
         slug = ref_id[4:]
 
-        # Catalog: "ref:<stem>-default"
+        # Catalog "ref:<lang>-default" → catalog/<lang>.<ext>
         if slug.endswith("-default"):
             stem = slug[: -len("-default")]
-            if not _SAFE_SLUG_RE.match(stem):
-                return None
-            catalog_root = self.catalog_dir.resolve()
-            for ext in _ALLOWED_EXTS:
-                p = (self.catalog_dir / f"{stem}{ext}").resolve()
-                # Defense in depth: even with the regex above, refuse anything
-                # that resolves outside catalog_dir.
-                if not _is_within(p, catalog_root):
-                    continue
-                if p.is_file():
-                    return p
-            return None
+            return self._resolve_in_catalog(stem)
 
-        # Upload: "ref:<first12hex>" — match files starting with that prefix
+        # Catalog "ref:<lang>-<name>" → catalog/<lang>-<name>.<ext>
+        if _NAMED_REF_RE.match(slug):
+            return self._resolve_in_catalog(slug)
+
+        # Uploads: hex-only slug → upload/<full_hash>.<ext>
         if not _looks_like_hex(slug):
             return None
         if not self.upload_dir.is_dir():
@@ -125,6 +145,19 @@ class RefStore:
             resolved = path.resolve()
             if _is_within(resolved, upload_root):
                 return resolved
+        return None
+
+    def _resolve_in_catalog(self, stem: str) -> Path | None:
+        """Look up <catalog>/<stem>.<ext> with containment check."""
+        if not _SAFE_SLUG_RE.match(stem):
+            return None
+        catalog_root = self.catalog_dir.resolve()
+        for ext in _ALLOWED_EXTS:
+            p = (self.catalog_dir / f"{stem}{ext}").resolve()
+            if not _is_within(p, catalog_root):
+                continue
+            if p.is_file():
+                return p
         return None
 
     # ---- upload ----

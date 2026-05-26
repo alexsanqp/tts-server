@@ -164,9 +164,54 @@ For providers that support cloning (today: Qwen3-TTS):
 2. Use that id as `"voice": "ref:abc123…"` in subsequent synthesis requests.
 3. Uploads are kept for `refs.upload_ttl_hours` (default 24h), then swept.
 
-Curated reference voices ship under `data/refs-catalog/` (e.g. `en.mp3` →
-`ref:en-default`). These have a paired `ref_text` string so Qwen knows what
-the clip is saying.
+#### Curated catalog (committed voices)
+
+Stable voices ship under `data/refs-catalog/` with this layout:
+
+```
+data/refs-catalog/
+├── en-owen.mp3       ← 5-15 s clean speech, one speaker
+├── en-owen.json      ← sidecar metadata (see below)
+├── en-mia.mp3
+├── en-mia.json
+└── ...
+```
+
+Filename schema:
+
+| Pattern | Resulting voice id | Use for |
+|---|---|---|
+| `<lang>-<name>.{mp3,wav}` | `ref:<lang>-<name>` | Named voices (Owen, Mia, …) |
+| `<lang>.{mp3,wav}` | `ref:<lang>-default` | One default voice per language |
+
+`<lang>` must be a Qwen-supported BCP-47 primary tag (`en, de, fr, it, es,
+ru, ja, ko, zh, pt`). Other tags get scanned but skipped — the file stays on
+disk for future providers (XTTS, Coqui) that may use it.
+
+#### Sidecar `.json` schema
+
+Each audio file pairs with `<stem>.json`:
+
+```json
+{
+  "ref_text": "Exact transcript of the audio, word for word.",
+  "gender": "male",
+  "description": "Primary English host. Clear, inspiring delivery.",
+  "role": "host"
+}
+```
+
+| Field | Required | Purpose |
+|---|---|---|
+| `ref_text` | recommended | Sent to Qwen alongside the audio; mismatch → broken output |
+| `gender` | optional | Surfaced in `/v1/voices` for client-side filtering |
+| `description` | optional | Free-text in `/v1/voices` metadata |
+| `role` | optional | Free-text (`host`, `sidekick`, `narrator`, …) |
+
+If the sidecar is missing or `ref_text` is empty, the caller must pass
+`ref_text` in the synthesis request body. Plain-stem files (e.g. `en.mp3`)
+fall back to a built-in default text — handy for quick demos, not for
+production.
 
 ## Configuration
 

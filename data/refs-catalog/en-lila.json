@@ -1,0 +1,8 @@
+{
+  "ref_text": "So I was reading this article the other day, and it kind of made me think about how often we underestimate the small stuff. Like, the tiny everyday things that somehow end up shaping our entire week, you know what I mean?",
+  "language": "en",
+  "gender": "female",
+  "description": "Secondary English female voice. Extremely natural, conversational, gen-Z podcast feel. Best for casual storytelling and follow-up commentary; complements Mia for dialog formats.",
+  "role": "sidekick",
+  "notes": "Save the generated sample as en-lila.mp3 or en-lila.wav alongside this file. If you regenerate with different text, update `ref_text` to match the new transcript exactly (word for word, including punctuation)."
+}

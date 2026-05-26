@@ -218,10 +218,11 @@ async def test_describe_returns_static_capabilities(tmp_path) -> None:
     assert caps.voices == ()  # empty dir
 
 
-async def test_describe_scans_ref_audio_dir_for_voices(tmp_path) -> None:
-    # Create dummy ref clips. Bytes don't matter — we only inspect the catalog.
+async def test_describe_scans_plain_stems_legacy_fallback(tmp_path) -> None:
+    # Plain stems still work: en.mp3 → ref:en-default with REF_TEXTS fallback,
+    # de.wav → ref:de-default with empty metadata. Junk files are ignored.
     (tmp_path / "en.mp3").write_bytes(b"\x00")
-    (tmp_path / "uk.wav").write_bytes(b"\x00")  # Ukrainian: not in QWEN_LANGUAGES, must be filtered out.
+    (tmp_path / "uk.wav").write_bytes(b"\x00")  # Ukrainian: not in QWEN_LANGUAGES.
     (tmp_path / "de.wav").write_bytes(b"\x00")
     (tmp_path / "notes.txt").write_text("ignored")
 
@@ -231,9 +232,6 @@ async def test_describe_scans_ref_audio_dir_for_voices(tmp_path) -> None:
         caps = await provider.describe()
 
     voice_ids = {v.id for v in caps.voices}
-    # uk.wav exists in the catalog dir but Qwen doesn't speak Ukrainian, so
-    # _scan_voices filters it. Advertising it would be a lie — synthesis with
-    # language=uk lands on the worker's UNSUPPORTED_LANGS check and 400s.
     assert voice_ids == {"ref:en-default", "ref:de-default"}
 
     by_id = {v.id: v for v in caps.voices}
@@ -244,9 +242,81 @@ async def test_describe_scans_ref_audio_dir_for_voices(tmp_path) -> None:
     assert en.accepts_clone_ref is True
     assert en.metadata.get("ref_text") == REF_TEXTS["en"]
 
-    # German has no curated ref_text — metadata should be empty.
+    # German plain stem: no sidecar, no REF_TEXTS entry → empty metadata.
     de = by_id["ref:de-default"]
     assert de.metadata == {}
+
+
+async def test_describe_reads_json_sidecar_for_named_voices(tmp_path) -> None:
+    """`<lang>-<name>.mp3` + `<lang>-<name>.json` becomes `ref:<lang>-<name>`."""
+    import json
+
+    (tmp_path / "en-owen.mp3").write_bytes(b"\x00")
+    (tmp_path / "en-owen.json").write_text(
+        json.dumps(
+            {
+                "ref_text": "Sample transcript for cloning.",
+                "gender": "male",
+                "description": "Primary host voice.",
+                "role": "host",
+                "language": "en",  # ignored; primary tag comes from the stem
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    provider = QwenProvider(options={"ref_audio_dir": str(tmp_path)})
+    caps = await provider.describe()
+
+    assert len(caps.voices) == 1
+    v = caps.voices[0]
+    assert v.id == "ref:en-owen"
+    assert v.languages == ("en",)
+    assert v.gender == "male"
+    assert v.metadata["ref_text"] == "Sample transcript for cloning."
+    assert v.metadata["description"] == "Primary host voice."
+    assert v.metadata["role"] == "host"
+
+
+async def test_describe_named_voice_without_sidecar_has_empty_metadata(tmp_path) -> None:
+    """No sidecar → voice still appears, but ref_text must come from caller."""
+    (tmp_path / "en-anon.mp3").write_bytes(b"\x00")
+
+    provider = QwenProvider(options={"ref_audio_dir": str(tmp_path)})
+    caps = await provider.describe()
+
+    assert len(caps.voices) == 1
+    v = caps.voices[0]
+    assert v.id == "ref:en-anon"
+    assert v.languages == ("en",)
+    assert v.metadata == {}  # no fallback for named voices — sidecar is required
+    assert v.gender is None
+
+
+async def test_describe_ignores_malformed_sidecar(tmp_path) -> None:
+    (tmp_path / "en-x.mp3").write_bytes(b"\x00")
+    (tmp_path / "en-x.json").write_text("not valid json {{{", encoding="utf-8")
+
+    provider = QwenProvider(options={"ref_audio_dir": str(tmp_path)})
+    caps = await provider.describe()
+
+    assert len(caps.voices) == 1
+    assert caps.voices[0].id == "ref:en-x"
+    assert caps.voices[0].metadata == {}
+
+
+async def test_describe_skips_unsafe_stems(tmp_path) -> None:
+    """Stems with disallowed chars (paths, dots, uppercase) get logged + skipped."""
+    (tmp_path / "Foo.mp3").write_bytes(b"\x00")        # uppercase rejected
+    (tmp_path / "en.bad.stem.mp3").write_bytes(b"\x00")  # extra dots rejected
+    (tmp_path / "en-OK_name.mp3").write_bytes(b"\x00")  # lowercase + underscore OK
+
+    provider = QwenProvider(options={"ref_audio_dir": str(tmp_path)})
+    caps = await provider.describe()
+
+    ids = {v.id for v in caps.voices}
+    # Only en-OK_name passes after lowercasing (regex permits underscore).
+    assert ids == {"ref:en-ok_name"}
 
 
 async def test_describe_dedupes_when_both_wav_and_mp3_exist(tmp_path) -> None:

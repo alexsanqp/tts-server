@@ -114,13 +114,41 @@ def test_catalog_ids_lists_distinct_stems(tmp_path: Path) -> None:
     catalog.mkdir()
     (catalog / "en.mp3").write_bytes(b"x")
     (catalog / "uk.wav").write_bytes(b"x")
+    (catalog / "en-owen.mp3").write_bytes(b"x")
     (catalog / "ignored.txt").write_text("nope")
     store = RefStore(catalog_dir=catalog, upload_dir=tmp_path / "u")
 
     ids = store.catalog_ids()
     assert "ref:en-default" in ids
     assert "ref:uk-default" in ids
+    assert "ref:en-owen" in ids
     assert all(i.startswith("ref:") for i in ids)
+
+
+def test_resolve_finds_named_catalog_entry(tmp_path: Path) -> None:
+    catalog = tmp_path / "catalog"
+    catalog.mkdir()
+    (catalog / "en-owen.mp3").write_bytes(b"x")
+    store = RefStore(catalog_dir=catalog, upload_dir=tmp_path / "u")
+
+    p = store.resolve("ref:en-owen")
+    assert p is not None
+    assert p.name == "en-owen.mp3"
+
+
+def test_resolve_named_rejects_dotted_or_traversal(tmp_path: Path) -> None:
+    catalog = tmp_path / "catalog"
+    catalog.mkdir()
+    store = RefStore(catalog_dir=catalog, upload_dir=tmp_path / "u")
+    for bad in [
+        "ref:en-..",
+        "ref:en-../etc",
+        "ref:EN-Owen",       # uppercase rejected
+        "ref:en-OWEN",       # uppercase rejected
+        "ref:en-",           # missing name
+        "ref:-owen",         # missing lang
+    ]:
+        assert store.resolve(bad) is None, f"resolved unsafe slug: {bad!r}"
 
 
 async def test_sweep_removes_expired(tmp_path: Path) -> None:

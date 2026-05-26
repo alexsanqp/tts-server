@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import wave
@@ -40,16 +42,14 @@ from tts_server.providers.base import (
 logger = logging.getLogger(__name__)
 
 
-# Curated default texts for ref clips named en.{wav,mp3}, uk.{wav,mp3}, ...
-# Mirrored from the sidecar worker so describe() doesn't import it.
+# Legacy fallback texts for plain-stem ref clips (e.g. en.mp3 → ref:en-default).
+# New deployments use <lang>-<name>.{mp3,wav} + <lang>-<name>.json sidecars
+# (see :meth:`QwenProvider._scan_voices`). Kept here so existing single-file
+# catalogs without a sidecar still expose a usable ref_text.
 REF_TEXTS: dict[str, str] = {
     "en": (
         "Hello, my name is your English teacher. "
         "Today we will learn new vocabulary words together."
-    ),
-    "uk": (
-        "Привіт, мене звати ваша вчителька. "
-        "Сьогодні ми вивчимо нові слова разом."
     ),
 }
 
@@ -59,6 +59,12 @@ QWEN_LANGUAGES: tuple[str, ...] = (
 )
 
 _REF_EXTS = (".wav", ".mp3")
+
+# Stem must be either a primary BCP-47 tag ("en", "uk") OR
+# <lang>-<voice-name> ("en-owen", "ja-akari", "de-anna_v2").
+# Anything else gets logged + skipped so accidental files in the
+# catalog don't pollute /v1/voices.
+_STEM_RE = re.compile(r"^([a-z]{2,3})(?:-([a-z0-9][a-z0-9_-]{0,30}))?$")
 
 
 class QwenProvider:
@@ -117,20 +123,35 @@ class QwenProvider:
         return any(v.id == voice_id for v in self._scan_voices())
 
     def _scan_voices(self) -> tuple[VoiceInfo, ...]:
-        """Inventory <ref_audio_dir>/*.{wav,mp3} restricted to Qwen-supported languages.
+        """Inventory ``<ref_audio_dir>/*.{wav,mp3}`` restricted to Qwen languages.
 
-        Each `<stem>.<ext>` becomes a VoiceInfo with id `ref:<stem>-default`.
-        Stems whose primary tag is not in :data:`QWEN_LANGUAGES` are skipped —
-        advertising e.g. `ref:uk-default` for Qwen would be misleading because
-        the worker rejects synthesis with HTTP 400. Drop those audio files
-        into the catalog for OTHER providers that may use them later.
-        Returns an empty tuple if the directory is missing or empty.
+        Two stem patterns are recognised:
+
+        * ``<lang>`` (e.g. ``en.mp3``)            → id ``ref:<lang>-default``
+        * ``<lang>-<name>`` (e.g. ``en-owen.mp3``) → id ``ref:<lang>-<name>``
+
+        For each audio file we look for a sibling ``<stem>.json`` sidecar:
+
+        .. code-block:: json
+
+           {
+             "ref_text": "Exact transcript of the audio.",
+             "gender": "male",
+             "description": "Primary host voice.",
+             "role": "host"
+           }
+
+        Without a sidecar, the legacy :data:`REF_TEXTS` dict (keyed by primary
+        language) supplies a fallback ``ref_text`` for plain-stem files. Stems
+        whose primary tag is not in :data:`QWEN_LANGUAGES` are skipped because
+        the worker would reject synthesis with HTTP 400 — silent-but-broken
+        catalog entries are worse than missing ones.
         """
         ref_dir = self._ref_audio_dir
         if not ref_dir.exists() or not ref_dir.is_dir():
             return ()
 
-        # Deduplicate by stem so en.mp3 + en.wav don't both register as ref:en-default.
+        # Deduplicate by stem (en.mp3 + en.wav → only one).
         seen: dict[str, Path] = {}
         for ext in _REF_EXTS:
             for path in sorted(ref_dir.glob(f"*{ext}")):
@@ -139,18 +160,33 @@ class QwenProvider:
                     seen[stem] = path
 
         voices: list[VoiceInfo] = []
-        for stem, _path in sorted(seen.items()):
-            primary = stem.lower()
+        for stem, path in sorted(seen.items()):
+            stem_lc = stem.lower()
+            match = _STEM_RE.match(stem_lc)
+            if match is None:
+                logger.warning(
+                    "Skipping %s: stem %r doesn't match '<lang>' or '<lang>-<name>'",
+                    path, stem,
+                )
+                continue
+
+            primary, voice_name = match.group(1), match.group(2)
             if primary not in QWEN_LANGUAGES:
-                continue  # Qwen can't synthesize this language; don't advertise.
-            metadata: dict[str, str] = {}
-            ref_text = REF_TEXTS.get(primary)
-            if ref_text:
-                metadata["ref_text"] = ref_text
+                continue  # Qwen can't synthesize this language.
+
+            voice_id = f"ref:{stem_lc}" if voice_name else f"ref:{primary}-default"
+            metadata, gender = _load_sidecar(path.with_suffix(".json"))
+
+            # Legacy fallback: hardcoded REF_TEXTS for plain-stem files only.
+            if voice_name is None and "ref_text" not in metadata:
+                if ref_text := REF_TEXTS.get(primary):
+                    metadata["ref_text"] = ref_text
+
             voices.append(
                 VoiceInfo(
-                    id=f"ref:{stem}-default",
+                    id=voice_id,
                     languages=(primary,),
+                    gender=gender,
                     accepts_voice_id=False,
                     accepts_clone_ref=True,
                     metadata=metadata,
@@ -411,3 +447,42 @@ def _wav_duration_ms(audio: bytes) -> int:
             return int(round(frames * 1000 / rate))
     except (wave.Error, EOFError):
         return 0
+
+
+_ALLOWED_SIDECAR_KEYS = ("description", "role")
+
+
+def _load_sidecar(sidecar: Path) -> tuple[dict[str, str], str | None]:
+    """Parse the JSON sidecar next to a ref-audio file.
+
+    Returns ``(metadata, gender)``. ``metadata`` is populated from any of
+    ``ref_text``, ``description``, ``role`` (when present and non-empty).
+    Malformed JSON or unreadable file is logged and treated as missing —
+    a bad sidecar must not crash provider startup.
+    """
+    metadata: dict[str, str] = {}
+    if not sidecar.is_file():
+        return metadata, None
+
+    try:
+        data = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+        logger.warning("Ignoring malformed ref sidecar %s: %s", sidecar, exc)
+        return metadata, None
+
+    if not isinstance(data, dict):
+        logger.warning("Sidecar %s is not a JSON object; ignoring", sidecar)
+        return metadata, None
+
+    if ref_text := data.get("ref_text"):
+        if isinstance(ref_text, str) and ref_text.strip():
+            metadata["ref_text"] = ref_text
+    for key in _ALLOWED_SIDECAR_KEYS:
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            metadata[key] = value
+
+    gender = data.get("gender")
+    if not isinstance(gender, str) or not gender.strip():
+        gender = None
+    return metadata, gender
