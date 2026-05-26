@@ -33,8 +33,9 @@ all of that behind a single OpenAI-shaped endpoint.
   clients that already speak OpenAI TTS.
 - **Built-in providers**: [edge-tts](https://github.com/rany2/edge-tts)
   (Microsoft cloud, free), [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS)
-  (local GPU, voice cloning, runs as a sidecar subprocess so reloads don't
-  cost a model reload), [StyleTTS2-UK](https://github.com/patriotyk/styletts2_inference)
+  (local GPU voice cloning — both `0.6B` and `1.7B` checkpoints supported
+  side-by-side, runs as a sidecar subprocess so reloads don't cost a model
+  reload), [StyleTTS2-UK](https://github.com/patriotyk/styletts2_inference)
   (Ukrainian local GPU).
 - **Honest voice catalog**: voices are probed at startup; retired or
   unreachable voices are flagged unavailable instead of failing at synthesis.
@@ -70,7 +71,7 @@ Provider extras:
 | Extra        | Pulls in                                         | Needs |
 |--------------|--------------------------------------------------|-------|
 | `edge`       | `edge-tts`, `langcodes`                          | Internet |
-| `qwen`       | `qwen-tts`, `soundfile`                          | CUDA GPU, ~2 GB VRAM |
+| `qwen`       | `qwen-tts`, `soundfile`                          | CUDA GPU — 0.6B: ~4 GB VRAM, 1.7B: ~6-8 GB VRAM |
 | `styletts2`  | `styletts2-inference`, `ipa-uk`, `truststore`, … | CUDA GPU |
 
 ## Quick start
@@ -291,6 +292,13 @@ ref_audio_dir = "data/refs-catalog"
 model_name = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
 device = "cuda:0"
 startup_timeout_seconds = 180
+
+[providers.qwen3-1.7b]           # opt-in: higher-quality 1.7B variant
+port = 8891                      # distinct sidecar port from 0.6B
+ref_audio_dir = "data/refs-catalog"
+model_name = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+device = "cuda:0"
+startup_timeout_seconds = 300
 
 [routing]
 default = "fake"

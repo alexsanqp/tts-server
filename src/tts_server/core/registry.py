@@ -26,7 +26,10 @@ logger = logging.getLogger(__name__)
 BUILTIN_PROVIDERS: dict[str, Any] = {
     "fake": FakeProvider,
     "edge": lambda opts: _lazy_import("tts_server.providers.edge", "EdgeProvider")(opts),
+    # Two Qwen variants share the same provider class; provider_id (injected
+    # below in startup()) selects the HF checkpoint and sidecar port.
     "qwen3-0.6b": lambda opts: _lazy_import("tts_server.providers.qwen", "QwenProvider")(opts),
+    "qwen3-1.7b": lambda opts: _lazy_import("tts_server.providers.qwen", "QwenProvider")(opts),
     "styletts2-uk": lambda opts: _lazy_import(
         "tts_server.providers.styletts2_uk", "StyleTTS2UkProvider"
     )(opts),
@@ -69,7 +72,12 @@ class ProviderRegistry:
                 logger.warning("Provider %r is enabled in config but not registered; skipping.", provider_id)
                 continue
 
-            opts = self._settings.providers.provider_options(provider_id)
+            # Inject the registered id so providers that back multiple
+            # config keys (e.g. qwen3-0.6b vs qwen3-1.7b) can self-identify.
+            # Unknown to providers that don't read it — they ignore extra
+            # keys via opts.get() lookups.
+            opts = dict(self._settings.providers.provider_options(provider_id))
+            opts.setdefault("provider_id", provider_id)
             try:
                 instance = factory(opts) if _factory_takes_arg(factory) else factory()
             except Exception as exc:

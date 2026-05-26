@@ -18,10 +18,14 @@ enabled = true
 max_entries = 256
 
 [providers]
-# Enable additional providers by uncommenting after installing the matching extra:
+# Enable providers after installing the matching extra:
 #   pip install -e ".[edge]"       -> edge
-#   pip install -e ".[qwen]"       -> qwen3-0.6b
+#   pip install -e ".[qwen]"       -> qwen3-0.6b / qwen3-1.7b
 #   pip install -e ".[styletts2]"  -> styletts2-uk
+#
+# qwen3-0.6b and qwen3-1.7b share the same provider class — pick one (or
+# both, if you have the VRAM budget). 1.7B has measurably lower WER but
+# needs ~6-8 GB peak; 0.6B is the fast fallback at ~4 GB.
 enabled  = ["fake", "edge", "qwen3-0.6b", "styletts2-uk"]
 # A required provider whose load fails makes /readyz report 503.
 required = []
@@ -39,6 +43,17 @@ ref_audio_dir = "data/refs-catalog"
 model_name = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
 device = "cuda:0"
 startup_timeout_seconds = 180
+
+# Higher-quality Qwen variant. Add "qwen3-1.7b" to `providers.enabled`
+# (and route the languages you care about to it under [routing.by_language])
+# to opt in. Sidecar runs on its own port so both can coexist.
+[providers.qwen3-1.7b]
+port = 8891
+host = "127.0.0.1"
+ref_audio_dir = "data/refs-catalog"
+model_name = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+device = "cuda:0"
+startup_timeout_seconds = 300
 
 [providers.styletts2-uk]
 default_voice = "Марина Панас"

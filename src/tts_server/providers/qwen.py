@@ -58,6 +58,23 @@ QWEN_LANGUAGES: tuple[str, ...] = (
     "en", "de", "fr", "it", "es", "ru", "ja", "ko", "zh", "pt",
 )
 
+# Per-variant defaults for QwenProvider. The provider_id is set by the
+# registry (one factory row per id in BUILTIN_PROVIDERS), which lets us
+# run two Qwen sidecars side-by-side: smaller-and-fast vs larger-and-better.
+# Both expose the same API and the same ``generate_voice_clone()`` flow —
+# the variant only changes the HF checkpoint and the sidecar port.
+_QWEN_VARIANTS: dict[str, dict[str, Any]] = {
+    "qwen3-0.6b": {
+        "model_name": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+        "port": 8890,
+    },
+    "qwen3-1.7b": {
+        "model_name": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+        "port": 8891,
+    },
+}
+_DEFAULT_PROVIDER_ID = "qwen3-0.6b"
+
 _REF_EXTS = (".wav", ".mp3")
 
 # Stem must be either a primary BCP-47 tag ("en", "uk") OR
@@ -72,14 +89,18 @@ class QwenProvider:
 
     def __init__(self, options: dict[str, Any] | None = None) -> None:
         opts = options or {}
-        self._port: int = int(opts.get("port", 8890))
+        # provider_id is injected by ProviderRegistry from BUILTIN_PROVIDERS;
+        # unknown ids fall back to the 0.6B defaults but keep the supplied id
+        # in caps.id so the registry can still address them correctly.
+        self._provider_id: str = str(opts.get("provider_id", _DEFAULT_PROVIDER_ID))
+        variant = _QWEN_VARIANTS.get(self._provider_id, _QWEN_VARIANTS[_DEFAULT_PROVIDER_ID])
+
+        self._port: int = int(opts.get("port", variant["port"]))
         self._host: str = str(opts.get("host", "127.0.0.1"))
         self._ref_audio_dir: Path = Path(
             opts.get("ref_audio_dir", "data/refs-catalog")
         )
-        self._model_name: str = str(
-            opts.get("model_name", "Qwen/Qwen3-TTS-12Hz-0.6B-Base")
-        )
+        self._model_name: str = str(opts.get("model_name", variant["model_name"]))
         self._device: str = str(opts.get("device", "cuda:0"))
         self._startup_timeout: float = float(
             opts.get("startup_timeout_seconds", 180.0)
@@ -88,11 +109,10 @@ class QwenProvider:
             opts.get("request_timeout", 120.0)
         )
 
-        # Path to capture sidecar stdout/stderr (CREATE_NEW_PROCESS_GROUP on
-        # Windows detaches stdio, so we always log to a file too).
+        # Per-variant log file so two Qwen sidecars don't clobber each other.
         log_dir = Path(opts.get("log_dir", "data"))
         log_dir.mkdir(parents=True, exist_ok=True)
-        self._log_path: Path = log_dir / "qwen_worker.log"
+        self._log_path: Path = log_dir / f"qwen_worker_{self._provider_id}.log"
 
         self._proc: subprocess.Popen[bytes] | None = None
         self._log_fh: Any = None
@@ -104,7 +124,7 @@ class QwenProvider:
     async def describe(self) -> ProviderCapabilities:
         voices = self._scan_voices()
         return ProviderCapabilities(
-            id="qwen3-0.6b",
+            id=self._provider_id,
             provider_family="qwen",
             languages=QWEN_LANGUAGES,
             voices=voices,

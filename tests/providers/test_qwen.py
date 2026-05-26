@@ -218,6 +218,69 @@ async def test_describe_returns_static_capabilities(tmp_path) -> None:
     assert caps.voices == ()  # empty dir
 
 
+async def test_provider_id_drives_caps_and_defaults(tmp_path) -> None:
+    """provider_id from registry picks the HF checkpoint and sidecar port.
+
+    Both Qwen variants share QwenProvider; the registry injects provider_id
+    into ``opts`` so multiple QwenProvider instances can coexist with
+    distinct models/ports/logs.
+    """
+    p06 = QwenProvider(options={
+        "provider_id": "qwen3-0.6b",
+        "ref_audio_dir": str(tmp_path),
+        "log_dir": str(tmp_path),
+    })
+    p17 = QwenProvider(options={
+        "provider_id": "qwen3-1.7b",
+        "ref_audio_dir": str(tmp_path),
+        "log_dir": str(tmp_path),
+    })
+
+    with patch("subprocess.Popen", side_effect=AssertionError("must not spawn")):
+        caps_06 = await p06.describe()
+        caps_17 = await p17.describe()
+
+    # caps.id reflects the registry id, not a hardcoded string.
+    assert caps_06.id == "qwen3-0.6b"
+    assert caps_17.id == "qwen3-1.7b"
+
+    # Defaults per-variant: model checkpoint + sidecar port + log file.
+    assert p06._model_name == "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+    assert p17._model_name == "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+    assert p06._port == 8890
+    assert p17._port == 8891
+    assert p06._log_path != p17._log_path
+    assert "qwen3-0.6b" in p06._log_path.name
+    assert "qwen3-1.7b" in p17._log_path.name
+
+
+async def test_explicit_options_override_variant_defaults(tmp_path) -> None:
+    """Explicit port / model_name in options beats the variant default."""
+    provider = QwenProvider(options={
+        "provider_id": "qwen3-1.7b",
+        "ref_audio_dir": str(tmp_path),
+        "log_dir": str(tmp_path),
+        "port": 9999,
+        "model_name": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+    })
+    assert provider._port == 9999
+    assert provider._model_name == "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+
+
+async def test_unknown_provider_id_falls_back_to_0_6b_defaults(tmp_path) -> None:
+    """Unknown provider_id still works: keeps caps.id but uses 0.6B defaults."""
+    provider = QwenProvider(options={
+        "provider_id": "qwen3-experimental",
+        "ref_audio_dir": str(tmp_path),
+        "log_dir": str(tmp_path),
+    })
+    with patch("subprocess.Popen", side_effect=AssertionError("must not spawn")):
+        caps = await provider.describe()
+    assert caps.id == "qwen3-experimental"  # preserved
+    assert provider._model_name == "Qwen/Qwen3-TTS-12Hz-0.6B-Base"  # 0.6B fallback
+    assert provider._port == 8890
+
+
 async def test_describe_scans_plain_stems_legacy_fallback(tmp_path) -> None:
     # Plain stems still work: en.mp3 → ref:en-default with REF_TEXTS fallback,
     # de.wav → ref:de-default with empty metadata. Junk files are ignored.
