@@ -171,7 +171,34 @@ the clip is saying.
 ## Configuration
 
 `config/tts-server.toml` — TOML, overridable by env (`TTS_*`, double
-underscore for nested keys, e.g. `TTS_SERVER__PORT=9000`).
+underscore for nested keys, e.g. `TTS_SERVER__PORT=9000`). Source priority:
+**env > TOML > defaults**.
+
+### Secrets
+
+**Never commit `auth_token` (or any secret) to the tracked
+`config/tts-server.toml`.** The repo file ships with `auth_token = ""` as a
+placeholder. Real tokens go in one of:
+
+- **An env var** (recommended for systemd / Docker):
+  ```bash
+  export TTS_SERVER__AUTH_TOKEN="$(python -c 'import secrets; print(secrets.token_hex(32))')"
+  python -m tts_server
+  ```
+- **A local TOML override** that's gitignored (`config/*.local.toml`, also
+  `config/secrets.toml`):
+  ```bash
+  # config/tts-server.local.toml  (NOT in git)
+  [server]
+  auth_token = "..."
+  ```
+  ```bash
+  python -m tts_server --config config/tts-server.local.toml
+  ```
+- **An `.env` file** (gitignored). See [`.env.example`](.env.example).
+
+Rotate the token by generating a new one and pushing it via the same
+channel (env var / local file) — no commit required.
 
 ```toml
 [server]

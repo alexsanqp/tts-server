@@ -23,6 +23,12 @@ cache/
 
 .env
 .env.local
+.env.*.local
+
+# Local config overrides — operator-specific secrets live here, never in
+# the tracked tts-server.toml.
+config/*.local.toml
+config/secrets.toml
 
 .idea/
 .vscode/
