@@ -46,6 +46,18 @@ _VOICE_DOWNLOAD_TEMPLATE = (
 )
 _DEFAULT_VOICE = "Марина Панас"
 _NATIVE_SAMPLE_RATE = 24000
+
+
+def _wav_duration_ms(wav_bytes: bytes, fallback_sample_rate: int) -> int:
+    """Read duration from an in-memory WAV. Returns 0 on parse failure."""
+    import wave
+
+    try:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as w:
+            sr = w.getframerate() or fallback_sample_rate
+            return int(round(w.getnframes() / sr * 1000))
+    except (wave.Error, EOFError):
+        return 0
 _MAX_TEXT_LENGTH = 2000
 
 # Catalog of voices advertised through /v1/voices. The HF Space exposes
@@ -315,7 +327,7 @@ class StyleTTS2UkProvider:
         return SynthesisStream(
             sample_rate=_NATIVE_SAMPLE_RATE,
             format="wav",
-            duration_ms=0,  # streamed back as a single WAV; client can probe.
+            duration_ms=_wav_duration_ms(wav_bytes, _NATIVE_SAMPLE_RATE),
             chunks=_one_chunk(),
         )
 

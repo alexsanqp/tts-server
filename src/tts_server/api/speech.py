@@ -9,7 +9,7 @@ import uuid
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from tts_server.api.routing import resolve_model
@@ -25,7 +25,12 @@ from tts_server.core.errors import (
 )
 from tts_server.core.refs import RefStore
 from tts_server.core.registry import ProviderEntry, ProviderRegistry
-from tts_server.providers.base import SynthesisRequest
+from tts_server.core.transcode import (
+    TranscoderError,
+    TranscoderUnavailable,
+    transcode,
+)
+from tts_server.providers.base import SynthesisRequest, SynthesisStream
 from tts_server.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -56,7 +61,7 @@ async def create_speech(
     cache: SynthesisCache = request.app.state.cache
 
     try:
-        resolved_model, _reason = resolve_model(
+        resolved_model, route_reason = resolve_model(
             settings, registry, model=body.model, language=body.language
         )
     except TTSError as exc:
@@ -82,6 +87,7 @@ async def create_speech(
         "X-Request-Id": request_id,
         "X-TTS-Provider": caps.provider_family,
         "X-TTS-Model": entry.id,
+        "X-Route-Reason": route_reason,
     }
 
     cache_key = cache.make_key(
@@ -101,7 +107,10 @@ async def create_speech(
 
     headers_meta["X-Cache"] = "miss"
 
-    if entry.concurrency.semaphore.locked() and _queue_depth(entry) >= settings.server.max_queue_depth:
+    # Admission control: refuse the request before it joins the queue if
+    # there's already no in-flight headroom AND the queue is at its cap.
+    ctl = entry.concurrency
+    if ctl.in_flight() >= ctl.limit and ctl.queue_depth() >= settings.server.max_queue_depth:
         raise _http_from_tts(CapacityExceeded("Server is at capacity, retry later"))
 
     try:
@@ -125,13 +134,15 @@ async def create_speech(
         target_format=body.response_format,
     )
 
+    # Whole-synthesis timeout (load → semaphore wait → synth → chunk drain).
+    # Without this, a slow provider stream could hold the GPU lane silently.
+    timeout = settings.server.request_timeout_seconds
     try:
-        async with entry.concurrency.semaphore:
-            stream = await asyncio.wait_for(
-                entry.instance.synthesize(synth_req),
-                timeout=settings.server.request_timeout_seconds,
+        async with entry.concurrency:
+            stream, audio_bytes = await asyncio.wait_for(
+                _drain_synthesis(entry, synth_req),
+                timeout=timeout,
             )
-            audio_bytes = b"".join([chunk async for chunk in stream.chunks])
     except asyncio.TimeoutError as exc:
         raise _http_from_tts(ProviderUnavailable("Synthesis timed out")) from exc
     except TTSError as exc:
@@ -140,14 +151,34 @@ async def create_speech(
         logger.exception("Provider %r raised during synthesize: %s", entry.id, exc)
         raise _http_from_tts(ProviderFailure(str(exc))) from exc
 
+    # Server-side transcoding: honor body.response_format and sample_rate.
+    # If both match the provider's output, this is a fast no-op.
+    final_audio, final_format, final_sample_rate, final_duration_ms = await _maybe_transcode(
+        audio=audio_bytes,
+        source_format=stream.format,
+        source_sample_rate=stream.sample_rate,
+        source_duration_ms=stream.duration_ms,
+        target_format=body.response_format,
+        target_sample_rate=body.sample_rate,
+    )
+
     cached_value = CachedAudio(
-        audio_bytes=audio_bytes,
-        sample_rate=stream.sample_rate,
-        format=stream.format,
-        duration_ms=stream.duration_ms,
+        audio_bytes=final_audio,
+        sample_rate=final_sample_rate,
+        format=final_format,
+        duration_ms=final_duration_ms,
     )
     cache.put(cache_key, cached_value)
     return _build_response(envelope, cached_value, headers_meta, request_id, caps, entry.id)
+
+
+async def _drain_synthesis(
+    entry: ProviderEntry, synth_req: SynthesisRequest
+) -> tuple[SynthesisStream, bytes]:
+    """Run synthesis and fully drain the chunk iterator into bytes."""
+    stream = await entry.instance.synthesize(synth_req)
+    audio_bytes = b"".join([chunk async for chunk in stream.chunks])
+    return stream, audio_bytes
 
 
 def _build_response(
@@ -161,6 +192,7 @@ def _build_response(
     headers_meta = dict(headers_meta)
     headers_meta["X-Sample-Rate"] = str(audio.sample_rate)
     headers_meta["X-Duration-Ms"] = str(audio.duration_ms)
+    headers_meta["X-Audio-Format"] = audio.format
 
     if envelope == "json":
         return JSONResponse(
@@ -176,12 +208,57 @@ def _build_response(
             headers=headers_meta,
         )
 
-    media_type = "audio/wav" if audio.format == "wav" else "audio/mpeg"
+    media_type = _media_type_for(audio.format)
+    # For fully-materialized bodies, plain Response is cheaper than StreamingResponse.
+    return Response(content=audio.audio_bytes, media_type=media_type, headers=headers_meta)
 
-    async def _one_chunk():
-        yield audio.audio_bytes
 
-    return StreamingResponse(_one_chunk(), media_type=media_type, headers=headers_meta)
+def _media_type_for(fmt: str) -> str:
+    return {
+        "wav": "audio/wav",
+        "mp3": "audio/mpeg",
+        "ogg": "audio/ogg",
+        "opus": "audio/opus",
+        "flac": "audio/flac",
+    }.get(fmt, "application/octet-stream")
+
+
+async def _maybe_transcode(
+    *,
+    audio: bytes,
+    source_format: str,
+    source_sample_rate: int,
+    source_duration_ms: int,
+    target_format: str,
+    target_sample_rate: int | None,
+) -> tuple[bytes, str, int, int]:
+    """Run ffmpeg only when needed; otherwise return source unchanged."""
+    needs_format = target_format != source_format
+    needs_resample = bool(target_sample_rate and target_sample_rate != source_sample_rate)
+    if not needs_format and not needs_resample:
+        return audio, source_format, source_sample_rate, source_duration_ms
+
+    try:
+        result = await transcode(
+            audio=audio,
+            source_format=source_format,
+            target_format=target_format,
+            target_sample_rate=target_sample_rate,
+        )
+    except TranscoderUnavailable as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": {"code": "transcoder_unavailable", "message": str(exc)}},
+        ) from exc
+    except TranscoderError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail={"error": {"code": "transcoder_failed", "message": str(exc)}},
+        ) from exc
+
+    new_rate = target_sample_rate or source_sample_rate
+    # Transcoding preserves wall-clock duration regardless of rate / format.
+    return result.audio, target_format, new_rate, source_duration_ms
 
 
 def _resolve_voice(
@@ -202,12 +279,12 @@ def _resolve_voice(
         if not caps.supports_voice_cloning:
             raise UnknownVoice("This model does not support voice cloning")
 
-        # Look up resolved local path via RefStore.
         local_path = ref_store.resolve(voice)
         if local_path is None:
-            raise UnknownVoice(f"Unknown ref voice {voice!r} (not in catalog and no matching upload)")
+            raise UnknownVoice(
+                f"Unknown ref voice {voice!r} (not in catalog and no matching upload)"
+            )
 
-        # If this ref is a curated catalog voice, pull its ref_text from VoiceInfo metadata.
         ref_text = None
         for v in caps.voices:
             if v.id == voice and v.accepts_clone_ref:
@@ -224,14 +301,10 @@ def _resolve_voice(
     raise UnknownVoice(f"Unknown voice {voice!r} for this model")
 
 
-def _queue_depth(entry: ProviderEntry) -> int:
-    sem = entry.concurrency.semaphore
-    waiters = getattr(sem, "_waiters", None)
-    return len(waiters) if waiters else 0
-
-
 def _http_from_tts(exc: TTSError) -> HTTPException:
+    headers = {"Retry-After": "5"} if exc.http_status == 503 else None
     return HTTPException(
         status_code=exc.http_status,
         detail={"error": {"code": exc.code, "message": exc.message}},
+        headers=headers,
     )

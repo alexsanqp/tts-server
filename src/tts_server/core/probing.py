@@ -29,7 +29,11 @@ async def probe_provider(entry, *, per_voice_timeout: float = 6.0) -> None:
                 timeout=per_voice_timeout,
             )
             return voice_id, bool(ok)
-        except (asyncio.TimeoutError, Exception) as exc:  # noqa: BLE001
+        except asyncio.CancelledError:
+            # Re-raise so the gather above propagates cancellation cleanly
+            # to the lifespan task and shutdown isn't masked.
+            raise
+        except Exception as exc:  # noqa: BLE001
             logger.debug("Voice probe failed: %s/%s: %s", entry.id, voice_id, exc)
             return voice_id, False
 

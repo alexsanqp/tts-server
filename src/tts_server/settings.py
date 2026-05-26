@@ -1,8 +1,12 @@
 """Application settings: TOML file + env overrides.
 
-Loading order:
-1. config/tts-server.toml (or path from $TTS_CONFIG_FILE / --config)
-2. environment variables (TTS_* prefix, double-underscore for nested keys)
+Source priority (highest wins):
+
+1. environment variables (``TTS_*`` prefix, ``__`` separator for nested keys —
+   e.g. ``TTS_SERVER__AUTH_TOKEN=secret``)
+2. TOML file (path from ``--config``, then ``$TTS_CONFIG_FILE``, then
+   ``./config/tts-server.toml`` next to the package)
+3. defaults baked into the model
 """
 
 from __future__ import annotations
@@ -13,7 +17,12 @@ from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic.fields import FieldInfo
+from pydantic_settings import (
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+)
 
 
 class ServerConfig(BaseModel):
@@ -56,6 +65,33 @@ class RoutingConfig(BaseModel):
     by_language: dict[str, str] = Field(default_factory=dict)
 
 
+# ----- pydantic-settings source for the TOML file ---------------------------
+
+
+class TomlConfigSource(PydanticBaseSettingsSource):
+    """Pydantic-settings source that merges values from a TOML file."""
+
+    def __init__(self, settings_cls: type[BaseSettings], path: Path | None) -> None:
+        super().__init__(settings_cls)
+        self._data: dict[str, Any] = {}
+        if path is not None and path.is_file():
+            with path.open("rb") as fh:
+                self._data = tomllib.load(fh)
+
+    def get_field_value(
+        self, field: FieldInfo, field_name: str
+    ) -> tuple[Any, str, bool]:
+        # Returning a value here is informational; __call__ below returns the
+        # full snapshot, which is what pydantic-settings actually merges.
+        return self._data.get(field_name), field_name, False
+
+    def __call__(self) -> dict[str, Any]:
+        return self._data
+
+
+# ----- Settings -------------------------------------------------------------
+
+
 class Settings(BaseSettings):
     server: ServerConfig = Field(default_factory=ServerConfig)
     refs: RefsConfig = Field(default_factory=RefsConfig)
@@ -68,6 +104,26 @@ class Settings(BaseSettings):
         env_nested_delimiter="__",
         extra="ignore",
     )
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        # Pull the TOML path out of init kwargs if the loader passed one.
+        toml_path: Path | None = None
+        if hasattr(init_settings, "init_kwargs"):
+            toml_path = init_settings.init_kwargs.pop("__toml_path__", None)
+        toml_source = TomlConfigSource(settings_cls, toml_path)
+
+        # Priority: highest first.
+        # init kwargs > env > TOML > defaults. This way an explicit Settings(server={...})
+        # in tests still wins, env vars override TOML on prod, and TOML beats defaults.
+        return (init_settings, env_settings, toml_source, file_secret_settings)
 
 
 def _default_config_path() -> Path | None:
@@ -83,7 +139,7 @@ def _default_config_path() -> Path | None:
 
 
 def load_settings(config_file: str | os.PathLike | None = None) -> Settings:
-    """Load settings: TOML file (if any) merged with env overrides."""
+    """Load settings with priority: env > TOML > defaults."""
     path: Path | None
     if config_file:
         path = Path(config_file)
@@ -92,9 +148,6 @@ def load_settings(config_file: str | os.PathLike | None = None) -> Settings:
     else:
         path = _default_config_path()
 
-    data: dict[str, Any] = {}
-    if path and path.is_file():
-        with path.open("rb") as fh:
-            data = tomllib.load(fh)
-
-    return Settings(**data)
+    # Pass the path through a synthetic init kwarg consumed by
+    # settings_customise_sources above.
+    return Settings(__toml_path__=path)  # type: ignore[arg-type]

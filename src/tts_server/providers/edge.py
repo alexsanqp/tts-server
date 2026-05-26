@@ -289,7 +289,7 @@ class EdgeProvider:
         return SynthesisStream(
             sample_rate=24000,
             format="mp3",
-            duration_ms=0,  # Edge doesn't report duration; let the API layer probe if needed.
+            duration_ms=_mp3_duration_ms(audio),
             chunks=_one_chunk(),
         )
 
@@ -315,3 +315,83 @@ class EdgeProvider:
         except Exception as exc:
             logger.debug("probe_voice(%r) failed: %s", voice_id, exc)
             return False
+
+
+# --- MP3 duration parser (pure Python; no extra deps) -----------------------
+#
+# Walks the MP3 frame headers and sums each frame's duration. Handles
+# MPEG-1/2/2.5 layer III at any bitrate / sample rate. Skips ID3v2 tag at
+# the start and ID3v1 tag at the end. Returns 0 on malformed input rather
+# than raising — duration is metadata, not safety-critical.
+
+_MP3_BITRATES = {
+    # (version, layer) -> tuple keyed by 4-bit bitrate index. Layer III only.
+    # MPEG-1 Layer III: ISO 11172-3 table.
+    (3, 1): (0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0),
+    # MPEG-2 / MPEG-2.5 Layer III: ISO 13818-3 table (lower rates).
+    (2, 1): (0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0),
+    (0, 1): (0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0),
+}
+_MP3_SAMPLE_RATES = {
+    3: (44100, 48000, 32000, 0),  # MPEG-1
+    2: (22050, 24000, 16000, 0),  # MPEG-2
+    0: (11025, 12000, 8000, 0),   # MPEG-2.5
+}
+
+
+def _mp3_duration_ms(data: bytes) -> int:
+    """Sum per-frame durations across an MP3 bytestream."""
+    if not data or len(data) < 4:
+        return 0
+
+    offset = 0
+    # Skip ID3v2 tag at start.
+    if data[:3] == b"ID3" and len(data) > 10:
+        size = (
+            (data[6] & 0x7F) << 21
+            | (data[7] & 0x7F) << 14
+            | (data[8] & 0x7F) << 7
+            | (data[9] & 0x7F)
+        )
+        offset = 10 + size
+
+    # Strip ID3v1 trailer.
+    end = len(data) - 128 if data[-128:-125] == b"TAG" else len(data)
+
+    duration_ms = 0.0
+    failures = 0
+    while offset + 4 <= end:
+        b0, b1, b2, b3 = data[offset], data[offset + 1], data[offset + 2], data[offset + 3]
+        if b0 != 0xFF or (b1 & 0xE0) != 0xE0:
+            offset += 1
+            failures += 1
+            if failures > 1024:
+                return 0
+            continue
+
+        version = (b1 >> 3) & 0x03  # 0=2.5, 2=2, 3=1
+        layer = (b1 >> 1) & 0x03    # 1=LayerIII
+        if layer != 1 or version == 1:
+            return 0  # not Layer III, or reserved
+
+        bitrate_idx = (b2 >> 4) & 0x0F
+        rate_idx = (b2 >> 2) & 0x03
+        padding = (b2 >> 1) & 0x01
+
+        try:
+            bitrate_kbps = _MP3_BITRATES[(version, layer)][bitrate_idx]
+            sample_rate = _MP3_SAMPLE_RATES[version][rate_idx]
+        except (KeyError, IndexError):
+            return 0
+        if bitrate_kbps == 0 or sample_rate == 0:
+            return 0
+
+        samples_per_frame = 1152 if version == 3 else 576  # Layer III
+        frame_bytes = (samples_per_frame * bitrate_kbps * 1000) // (8 * sample_rate) + padding
+        if frame_bytes <= 0:
+            return 0
+        duration_ms += samples_per_frame * 1000 / sample_rate
+        offset += frame_bytes
+        failures = 0
+
+    return int(round(duration_ms))

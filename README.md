@@ -6,7 +6,7 @@ plugins. One HTTP endpoint for every TTS engine you wire in.
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-108%20passing-success.svg)](#development)
+[![Tests](https://img.shields.io/badge/tests-125%20passing-success.svg)](#development)
 
 ---
 
@@ -290,7 +290,7 @@ That's it. `/v1/models` now lists your provider; `/v1/audio/speech` with
 
 ```bash
 pip install -e ".[all,dev]"
-pytest                                  # 108 tests (~1s; one StyleTTS2 GPU test ~30s when CUDA present)
+pytest                                  # 125 tests (~1s; one StyleTTS2 GPU test ~30s when CUDA present)
 pytest -m "not network and not gpu"     # default — skips env-gated tests
 RUN_NETWORK_TESTS=1 pytest              # include real edge-tts calls
 ruff check src tests

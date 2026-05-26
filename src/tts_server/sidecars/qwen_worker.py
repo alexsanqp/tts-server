@@ -14,10 +14,13 @@ API:
     {
         "text": "Hello, how are you?",
         "language": "en",
-        "ref_audio": "/path/to/ref.wav"  (optional, for voice cloning)
+        "ref_audio": "/path/to/ref.wav"   (optional, for voice cloning)
         "ref_text":  "spoken text in the ref clip"
     }
-    -> returns audio/wav binary, header X-Sample-Rate: 24000
+    -> 200 audio/wav binary, header X-Sample-Rate: 24000
+    -> 400 {"error": "..."} for bad input
+    -> 500 {"error": "synthesis_failed"} for internal failures
+       (full traceback logged server-side; not echoed to caller)
 
     GET /health -> {"status": "ok", "model_loaded": true|false}
 """
@@ -29,18 +32,18 @@ import io
 import json
 import logging
 import os
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 _model = None
-_ref_audio_cache: dict[str, str] = {}  # lang -> ref audio path
+_ref_audio_cache: dict[str, str] = {}  # primary lang tag -> ref audio path
 
 
+# Qwen3-TTS supported language tags + human-readable name expected by the model.
 LANG_MAP = {
     "en": "English",
-    # "uk" not supported by Qwen — use edge-tts (uk-UA-PolinaNeural)
     "de": "German",
     "fr": "French",
     "es": "Spanish",
@@ -52,18 +55,17 @@ LANG_MAP = {
     "it": "Italian",
 }
 
-# Languages NOT supported by Qwen3-TTS (use edge-tts fallback)
-UNSUPPORTED_LANGS = {"uk", "pl", "ar", "hi", "tr"}
+# Languages NOT supported by Qwen3-TTS. Returned as 400 so the caller can
+# route elsewhere (e.g. lingua-pairs uses edge-tts for uk).
+UNSUPPORTED_LANGS = frozenset({"uk", "pl", "ar", "hi", "tr", "nl", "sv", "no", "fi", "da"})
 
-# Reference texts for generating default voice samples
+# Curated reference texts for the baked-in ref clips. **Must** stay in sync
+# with `tts_server/providers/qwen.py:REF_TEXTS` (it's mirrored there so the
+# proxy's describe() doesn't need to import this worker module).
 REF_TEXTS = {
     "en": (
         "Hello, my name is your English teacher. "
         "Today we will learn new vocabulary words together."
-    ),
-    "uk": (
-        "Привіт, мене звати ваша вчителька. "
-        "Сьогодні ми вивчимо нові слова разом."
     ),
 }
 
@@ -90,47 +92,53 @@ def _load_model():
     logger.info("Qwen3-TTS model loaded successfully")
 
 
-def _get_ref_audio(language: str) -> tuple[str, str] | tuple[None, None]:
-    """Get or create reference audio for voice cloning.
-
-    Returns (ref_audio_path, ref_text) or (None, None).
-    """
-    if language in _ref_audio_cache:
-        ref_text = REF_TEXTS.get(language, REF_TEXTS["en"])
-        return _ref_audio_cache[language], ref_text
-
-    # No cached ref audio — caller should use without cloning
-    return None, None
-
-
 def synthesize_text(
     text: str,
     language: str = "en",
     ref_audio: str | None = None,
     ref_text: str | None = None,
 ) -> tuple[bytes, int]:
-    """Synthesize text using Qwen3-TTS.
+    """Synthesize text using Qwen3-TTS. Returns (wav_bytes, sample_rate).
 
-    Returns (wav_bytes, sample_rate).
+    Raises ValueError for client-facing errors (unsupported language, missing
+    ref-audio/ref-text). Other exceptions are internal failures.
     """
     _load_model()
 
     import soundfile as sf
 
-    lang_full = LANG_MAP.get(language, language)
+    primary = language.split("-")[0].lower() if language else "en"
+    if primary in UNSUPPORTED_LANGS:
+        raise ValueError(
+            f"language {primary!r} is not supported by Qwen3-TTS; "
+            f"route to an alternate provider (edge-tts handles most)"
+        )
 
-    # Use provided ref_audio, or try cached
-    if ref_audio is None:
-        ref_audio, ref_text = _get_ref_audio(language)
+    lang_full = LANG_MAP.get(primary)
+    if lang_full is None:
+        raise ValueError(
+            f"unknown language {language!r}; supported: {sorted(LANG_MAP)}"
+        )
 
+    # If caller didn't pass ref_audio, try the catalog by primary tag.
     if ref_audio is None:
-        # Fallback: try English ref audio for any language
-        ref_audio, ref_text = _get_ref_audio("en")
+        ref_audio = _ref_audio_cache.get(primary)
+        # Reference text falls back to the catalog's curated default — but
+        # ONLY if the language matches the catalog entry. Pairing a German
+        # text intent with an English ref_text (or vice-versa) produced
+        # broken output in earlier versions; refuse instead.
+        if ref_audio is not None and ref_text is None:
+            ref_text = REF_TEXTS.get(primary)
 
     if ref_audio is None:
         raise ValueError(
-            f"No reference audio for language '{language}'. "
-            "Place en.mp3/uk.mp3 in --ref-audio-dir."
+            f"no reference audio for language {primary!r}; "
+            f"either upload one via POST /v1/refs or pass `ref_audio` directly"
+        )
+    if ref_text is None:
+        raise ValueError(
+            f"`ref_text` is required for voice cloning and was not provided "
+            f"(no curated default for {primary!r})"
         )
 
     wavs, sr = _model.generate_voice_clone(
@@ -149,16 +157,20 @@ def synthesize_text(
 class TTSHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path != "/synthesize":
-            self.send_error(404, "Not Found")
+            self._json_error(404, "not_found", "unknown path")
             return
 
-        content_length = int(self.headers.get("Content-Length", 0))
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            self._json_error(400, "invalid_content_length", "Content-Length must be an integer")
+            return
         body = self.rfile.read(content_length)
 
         try:
             data = json.loads(body)
         except json.JSONDecodeError:
-            self.send_error(400, "Invalid JSON")
+            self._json_error(400, "invalid_json", "request body is not valid JSON")
             return
 
         text = data.get("text", "")
@@ -167,42 +179,50 @@ class TTSHandler(BaseHTTPRequestHandler):
         ref_text = data.get("ref_text")
 
         if not text:
-            self.send_error(400, "Missing 'text' field")
+            self._json_error(400, "missing_text", "request requires non-empty 'text' field")
             return
 
         try:
-            audio_bytes, sr = synthesize_text(
-                text, language, ref_audio, ref_text,
-            )
-            self.send_response(200)
-            self.send_header("Content-Type", "audio/wav")
-            self.send_header("Content-Length", str(len(audio_bytes)))
-            self.send_header("X-Sample-Rate", str(sr))
-            self.end_headers()
-            self.wfile.write(audio_bytes)
+            audio_bytes, sr = synthesize_text(text, language, ref_audio, ref_text)
+        except ValueError as e:
+            # Client-facing input errors — message is safe to echo.
+            self._json_error(400, "invalid_input", str(e))
+            return
         except Exception as e:
-            logger.error("Synthesis error: %s", e)
-            error_msg = str(e).encode("utf-8")
-            self.send_response(500)
-            self.send_header("Content-Type", "text/plain")
-            self.send_header("Content-Length", str(len(error_msg)))
-            self.end_headers()
-            self.wfile.write(error_msg)
+            # Internal failure — log full detail server-side, hide from caller.
+            logger.exception("Synthesis failed: %s", e)
+            self._json_error(500, "synthesis_failed", "internal synthesis error")
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "audio/wav")
+        self.send_header("Content-Length", str(len(audio_bytes)))
+        self.send_header("X-Sample-Rate", str(sr))
+        self.end_headers()
+        self.wfile.write(audio_bytes)
 
     def do_GET(self):
         if self.path == "/health":
+            payload = json.dumps(
+                {"status": "ok", "model_loaded": _model is not None}
+            ).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
-            status = {
-                "status": "ok",
-                "model_loaded": _model is not None,
-            }
-            self.wfile.write(json.dumps(status).encode())
+            self.wfile.write(payload)
         else:
-            self.send_error(404, "Not Found")
+            self._json_error(404, "not_found", "unknown path")
 
-    def log_message(self, fmt, *args):
+    def _json_error(self, status: int, code: str, message: str) -> None:
+        payload = json.dumps({"error": {"code": code, "message": message}}).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, fmt, *args):  # noqa: A003
         logger.info(fmt, *args)
 
 
@@ -217,7 +237,7 @@ def main():
     parser.add_argument(
         "--ref-audio-dir",
         default="data/refs-catalog",
-        help="Directory with reference audio files (en.wav, uk.wav, ...)",
+        help="Directory with reference audio files (en.wav, en.mp3, ...)",
     )
     args = parser.parse_args()
 
@@ -226,7 +246,6 @@ def main():
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
 
-    # Load reference audio files if available
     ref_dir = Path(args.ref_audio_dir)
     if ref_dir.exists():
         for lang_code in LANG_MAP:
@@ -240,7 +259,11 @@ def main():
         logger.info("Preloading Qwen3-TTS model...")
         _load_model()
 
-    server = HTTPServer((args.host, args.port), TTSHandler)
+    # ThreadingHTTPServer allows /health to respond during a slow synthesize().
+    # The actual concurrency cap is enforced by the proxy's per-provider
+    # asyncio.Semaphore — this is just to avoid head-of-line blocking on
+    # health probes.
+    server = ThreadingHTTPServer((args.host, args.port), TTSHandler)
     logger.info(
         "Qwen3-TTS sidecar on %s:%d (ref voices: %s)",
         args.host, args.port,
