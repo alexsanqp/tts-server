@@ -11,12 +11,13 @@ Source priority (highest wins):
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import tomllib
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from pydantic.fields import FieldInfo
 from pydantic_settings import (
     BaseSettings,
@@ -25,12 +26,49 @@ from pydantic_settings import (
 )
 
 
+def _is_loopback_host(host: str) -> bool:
+    """True for 127.x, ::1, or the literal name 'localhost'."""
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 class ServerConfig(BaseModel):
-    host: str = "0.0.0.0"
+    # Default to loopback. Operators who want LAN/Internet exposure must
+    # set both `host` AND `auth_token` explicitly — see the validator below.
+    host: str = "127.0.0.1"
     port: int = 8880
     auth_token: str = ""
     request_timeout_seconds: float = 120.0
     max_queue_depth: int = 32
+    # CORS allowlist for browser clients hitting /v1/audio/speech etc.
+    # Empty (default) = no CORS middleware mounted, browser fetches from
+    # other origins are blocked by the browser. Set to ["*"] for fully
+    # open access (intra-LAN dev), or list specific origins for prod.
+    cors_allow_origins: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _refuse_open_synth_on_network_interface(self) -> "ServerConfig":
+        """Block obvious self-foot-gun: open synth endpoint on a routable interface.
+
+        If ``host`` is anything other than a loopback address and
+        ``auth_token`` is empty, every caller on the LAN/Internet can burn
+        the operator's GPU minutes unauthenticated. Refuse to start —
+        either bind to 127.0.0.1 (recommended; put a reverse proxy in
+        front if you need external reach) or set a token.
+        """
+        if not _is_loopback_host(self.host) and not self.auth_token:
+            raise ValueError(
+                f"server.host={self.host!r} is not a loopback address but "
+                "server.auth_token is empty. Refusing to start an open "
+                "synthesis endpoint on a network interface — either bind "
+                "to 127.0.0.1 (and front it with a reverse proxy if you "
+                "need external reach) or set a non-empty auth_token."
+            )
+        return self
 
 
 class RefsConfig(BaseModel):
