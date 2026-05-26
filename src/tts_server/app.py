@@ -6,7 +6,10 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from tts_server.api import health, models, refs, routing, speech
 from tts_server.core.cache import SynthesisCache
@@ -16,6 +19,37 @@ from tts_server.core.registry import ProviderRegistry
 from tts_server.settings import Settings, load_settings
 
 logger = logging.getLogger(__name__)
+
+
+async def _validation_error_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    """Reshape FastAPI's default 422 into the same ``{error: {code, message}}``
+    envelope our app-level errors use, so external clients only need to
+    parse one shape. The original per-field details are preserved under
+    ``error.fields`` for debuggability.
+    """
+    errors = exc.errors()
+    primary = errors[0]["msg"] if errors else "validation failed"
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": {
+                "error": {
+                    "code": "validation_error",
+                    "message": primary,
+                    "fields": [
+                        {
+                            "loc": [str(p) for p in err.get("loc", ())],
+                            "msg": err.get("msg", ""),
+                            "type": err.get("type", ""),
+                        }
+                        for err in errors
+                    ],
+                }
+            }
+        },
+    )
 
 
 @asynccontextmanager
@@ -77,6 +111,33 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.registry = registry
     app.state.ref_store = ref_store
     app.state.cache = cache
+
+    # Unified error shape: pydantic 422s flow through the same envelope as
+    # our app-level errors, so clients only need one branch to parse 4xx.
+    app.add_exception_handler(RequestValidationError, _validation_error_handler)
+
+    # Optional CORS. Empty allowlist = no middleware mounted (browser fetches
+    # from other origins are rejected by the browser). Operators opt in by
+    # setting ``cors_allow_origins`` in [server].
+    if settings.server.cors_allow_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=settings.server.cors_allow_origins,
+            allow_credentials=False,
+            allow_methods=["GET", "POST", "OPTIONS"],
+            allow_headers=["Authorization", "Content-Type"],
+            expose_headers=[
+                "X-Request-Id",
+                "X-TTS-Provider",
+                "X-TTS-Model",
+                "X-Sample-Rate",
+                "X-Duration-Ms",
+                "X-Audio-Format",
+                "X-Cache",
+                "X-Route-Reason",
+            ],
+            max_age=600,
+        )
 
     app.include_router(health.router)
     app.include_router(models.router, prefix="/v1")

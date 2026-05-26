@@ -53,11 +53,56 @@ class SpeechRequest(BaseModel):
     works but is pure interpolation — the model has no information
     above 24 kHz.
     """
-    input: str = Field(..., min_length=1, description="Text to synthesize")
-    model: str = Field(default="auto", description="Provider id, or 'auto' to route by language")
-    language: str = Field(default="en", description="BCP-47 tag, e.g. en, en-US, uk")
-    voice: str | None = Field(default=None, description="Voice id or 'ref:<id>' for cloning")
-    speed: float = Field(default=1.0, ge=0.25, le=4.0)
+
+    # Hard upper bound on Pydantic side so an oversized body is rejected
+    # before we hash it, queue it, or load a model. Per-provider limits
+    # (``caps.max_text_length``) refine this further after routing.
+    input: str = Field(
+        ...,
+        min_length=1,
+        max_length=8000,
+        description="Text to synthesize (UTF-8, up to 8000 chars).",
+    )
+    model: str = Field(
+        default="auto",
+        description="Provider id (e.g. 'edge', 'qwen3-0.6b', 'qwen3-1.7b', 'styletts2-uk') or 'auto' to route by language.",
+    )
+    language: str = Field(
+        default="en",
+        description="BCP-47 tag, e.g. 'en', 'en-US', 'uk'. Used for routing when model='auto'.",
+    )
+    voice: str | None = Field(
+        default=None,
+        description=(
+            "Voice id (e.g. 'en-US-AriaNeural', 'Марина Панас') OR a "
+            "cloning reference 'ref:<id>'. Three ref forms are recognised: "
+            "'ref:<lang>-default' (catalog default per language), "
+            "'ref:<lang>-<name>' (named catalog voice), "
+            "'ref:<hex12+>' (uploaded via POST /v1/refs). "
+            "null = use the provider's default voice."
+        ),
+        examples=[
+            "en-US-AriaNeural",
+            "ref:en-default",
+            "ref:en-owen",
+            "ref:a1b2c3d4e5f6",
+        ],
+    )
+    ref_text: str | None = Field(
+        default=None,
+        description=(
+            "Optional transcript override for voice-cloning requests. "
+            "When set, takes precedence over the catalog sidecar's "
+            "ref_text. Required for cloning providers (e.g. Qwen) when "
+            "the chosen ref voice has no sidecar JSON."
+        ),
+    )
+    speed: float = Field(
+        default=1.0,
+        ge=0.25,
+        le=4.0,
+        description="Speech rate multiplier; 1.0 = native cadence.",
+    )
     response_format: Literal["wav", "mp3"] = Field(
         default="wav",
         description="Audio container. 'wav' is lossless; 'mp3' for smaller payloads.",
@@ -72,7 +117,16 @@ class SpeechRequest(BaseModel):
             "above 24000 only upsample — no extra fidelity from the model."
         ),
     )
-    idempotency_key: str | None = Field(default=None)
+    idempotency_key: str | None = Field(
+        default=None,
+        description=(
+            "Optional cache salt. The cache key is sha256(content) on "
+            "its own; supplying this value namespaces the slot so that "
+            "(a) retries of the same request with the same key dedupe "
+            "and (b) different requests sharing a key by accident do "
+            "NOT collide. Scope the key to a UUID per logical operation."
+        ),
+    )
 
 
 @router.post("/audio/speech", dependencies=[Depends(optional_bearer_token)])
@@ -133,12 +187,6 @@ async def create_speech(
 
     headers_meta["X-Cache"] = "miss"
 
-    # Admission control: refuse the request before it joins the queue if
-    # there's already no in-flight headroom AND the queue is at its cap.
-    ctl = entry.concurrency
-    if ctl.in_flight() >= ctl.limit and ctl.queue_depth() >= settings.server.max_queue_depth:
-        raise _http_from_tts(CapacityExceeded("Server is at capacity, retry later"))
-
     try:
         await asyncio.wait_for(
             registry.ensure_loaded(entry),
@@ -149,26 +197,37 @@ async def create_speech(
     except TTSError as exc:
         raise _http_from_tts(exc) from exc
 
+    # Caller-supplied ref_text wins over the catalog sidecar's value.
+    # When the catalog provided one and the body didn't, keep the catalog one.
+    effective_ref_text = body.ref_text if body.ref_text is not None else ref_text
+
     synth_req = SynthesisRequest(
         text=body.input,
         language=body.language,
         voice=voice_id,
         voice_kind=voice_kind,
-        ref_text=ref_text,
+        ref_text=effective_ref_text,
         speed=body.speed,
         target_sample_rate=body.sample_rate,
         target_format=body.response_format,
     )
 
-    # Whole-synthesis timeout (load → semaphore wait → synth → chunk drain).
-    # Without this, a slow provider stream could hold the GPU lane silently.
+    # Atomic admission control: acquire reserves a slot AND grabs the
+    # semaphore, or returns False without state change. Two callers can
+    # no longer race past the check and breach max_queue_depth.
+    ctl = entry.concurrency
+    admitted = await ctl.acquire(max_queue_depth=settings.server.max_queue_depth)
+    if not admitted:
+        raise _http_from_tts(CapacityExceeded("Server is at capacity, retry later"))
+
+    # Synth-only timeout: budget starts AFTER admission so a slow
+    # predecessor doesn't burn this caller's window in the queue.
     timeout = settings.server.request_timeout_seconds
     try:
-        async with entry.concurrency:
-            stream, audio_bytes = await asyncio.wait_for(
-                _drain_synthesis(entry, synth_req),
-                timeout=timeout,
-            )
+        stream, audio_bytes = await asyncio.wait_for(
+            _drain_synthesis(entry, synth_req),
+            timeout=timeout,
+        )
     except asyncio.TimeoutError as exc:
         raise _http_from_tts(ProviderUnavailable("Synthesis timed out")) from exc
     except TTSError as exc:
@@ -176,6 +235,8 @@ async def create_speech(
     except Exception as exc:
         logger.exception("Provider %r raised during synthesize: %s", entry.id, exc)
         raise _http_from_tts(ProviderFailure(str(exc))) from exc
+    finally:
+        ctl.release()
 
     # Server-side transcoding: honor body.response_format and sample_rate.
     # If both match the provider's output, this is a fast no-op.
