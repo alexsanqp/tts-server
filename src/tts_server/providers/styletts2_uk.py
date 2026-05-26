@@ -30,6 +30,7 @@ from typing import Any
 from unicodedata import normalize as _unicode_normalize
 
 from tts_server.core.errors import UnknownVoice, UnsupportedLanguage
+from tts_server.core.wav import wav_duration_ms as _wav_duration_ms
 from tts_server.providers.base import (
     ProviderCapabilities,
     SynthesisRequest,
@@ -48,16 +49,6 @@ _DEFAULT_VOICE = "Марина Панас"
 _NATIVE_SAMPLE_RATE = 24000
 
 
-def _wav_duration_ms(wav_bytes: bytes, fallback_sample_rate: int) -> int:
-    """Read duration from an in-memory WAV. Returns 0 on parse failure."""
-    import wave
-
-    try:
-        with wave.open(io.BytesIO(wav_bytes), "rb") as w:
-            sr = w.getframerate() or fallback_sample_rate
-            return int(round(w.getnframes() / sr * 1000))
-    except (wave.Error, EOFError):
-        return 0
 _MAX_TEXT_LENGTH = 2000
 
 # Catalog of voices advertised through /v1/voices. The HF Space exposes
@@ -327,7 +318,7 @@ class StyleTTS2UkProvider:
         return SynthesisStream(
             sample_rate=_NATIVE_SAMPLE_RATE,
             format="wav",
-            duration_ms=_wav_duration_ms(wav_bytes, _NATIVE_SAMPLE_RATE),
+            duration_ms=_wav_duration_ms(wav_bytes, fallback_sample_rate=_NATIVE_SAMPLE_RATE),
             chunks=_one_chunk(),
         )
 
@@ -357,6 +348,21 @@ class StyleTTS2UkProvider:
         import torch
 
         path = _ensure_voice_file(voice, self._cache_dir)
-        style = torch.load(str(path), map_location=self._device or "cpu")
+        # weights_only=True refuses pickle opcodes outside the allow-list,
+        # blocking arbitrary code execution if the .pt file is replaced
+        # by a hostile HF mirror (no checksum on _ensure_voice_file).
+        # StyleTTS2 style vectors are plain torch.Tensor — they don't need
+        # any custom classes, so the safe loader works.
+        try:
+            style = torch.load(
+                str(path), map_location=self._device or "cpu", weights_only=True
+            )
+        except TypeError:
+            # torch < 2.0 doesn't have weights_only; safer to fail than to
+            # silently fall back to the unsafe loader.
+            raise RuntimeError(
+                "torch >= 2.0 is required to load voice styles safely "
+                "(weights_only=True parameter unsupported in this version)"
+            ) from None
         self._voice_cache[voice] = style
         return style
