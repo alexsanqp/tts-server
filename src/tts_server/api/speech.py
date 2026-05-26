@@ -39,13 +39,39 @@ router = APIRouter(tags=["speech"])
 
 
 class SpeechRequest(BaseModel):
+    """Request body for ``POST /v1/audio/speech``.
+
+    Defaults are chosen for maximum fidelity with the current providers
+    (Qwen3-TTS, StyleTTS2-UK, edge-tts — all native 24 kHz):
+
+    * ``response_format = "wav"`` — lossless container, no codec noise.
+    * ``sample_rate = 24000`` — matches the providers' native rate so no
+      ffmpeg resampling happens on the hot path.
+
+    Override either when you'd rather have a smaller payload (``mp3``,
+    or a lower ``sample_rate`` like ``16000``). Asking for ``48000``
+    works but is pure interpolation — the model has no information
+    above 24 kHz.
+    """
     input: str = Field(..., min_length=1, description="Text to synthesize")
-    model: str = Field(default="auto")
+    model: str = Field(default="auto", description="Provider id, or 'auto' to route by language")
     language: str = Field(default="en", description="BCP-47 tag, e.g. en, en-US, uk")
     voice: str | None = Field(default=None, description="Voice id or 'ref:<id>' for cloning")
     speed: float = Field(default=1.0, ge=0.25, le=4.0)
-    response_format: Literal["wav", "mp3"] = Field(default="wav")
-    sample_rate: int | None = Field(default=None, ge=8000, le=48000)
+    response_format: Literal["wav", "mp3"] = Field(
+        default="wav",
+        description="Audio container. 'wav' is lossless; 'mp3' for smaller payloads.",
+    )
+    sample_rate: int = Field(
+        default=24000,
+        ge=8000,
+        le=48000,
+        description=(
+            "Output sample rate in Hz. Default 24000 matches every "
+            "current provider's native rate (no resampling). Values "
+            "above 24000 only upsample — no extra fidelity from the model."
+        ),
+    )
     idempotency_key: str | None = Field(default=None)
 
 

@@ -81,7 +81,9 @@ python -m tts_server                  # http://0.0.0.0:8880
 # or:  tts-server --port 8881 --log-level debug
 ```
 
-Synthesize:
+Synthesize. Defaults are tuned for maximum fidelity — lossless WAV at
+24 kHz (the native rate of every shipped provider, so no resampling
+happens on the hot path):
 
 ```bash
 curl -X POST http://localhost:8880/v1/audio/speech \
@@ -92,20 +94,34 @@ curl -X POST http://localhost:8880/v1/audio/speech \
         "voice": "en-US-AriaNeural",
         "model": "auto"
       }' \
-  --output hello.mp3
+  --output hello.wav
 ```
 
 The response is raw audio with metadata in headers:
 
 ```
 HTTP/1.1 200 OK
-Content-Type: audio/mpeg
+Content-Type: audio/wav
 X-TTS-Provider: edge
 X-TTS-Model: edge
+X-Audio-Format: wav
 X-Sample-Rate: 24000
 X-Duration-Ms: 1820
 X-Cache: miss
 X-Request-Id: 1f3a…
+```
+
+Want a smaller payload (mp3) instead? Set ``response_format``:
+
+```bash
+curl -X POST http://localhost:8880/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+        "input": "Hello, world.",
+        "voice": "en-US-AriaNeural",
+        "response_format": "mp3"
+      }' \
+  --output hello.mp3
 ```
 
 Need JSON-with-base64 instead of raw bytes (browser clients, easier
@@ -120,7 +136,7 @@ curl -X POST 'http://localhost:8880/v1/audio/speech?envelope=json' \
 ```json
 {
   "audio_base64": "UklGRn...",
-  "format": "mp3",
+  "format": "wav",
   "sample_rate": 24000,
   "duration_ms": 1820,
   "provider": "edge",
@@ -147,15 +163,50 @@ curl -X POST 'http://localhost:8880/v1/audio/speech?envelope=json' \
 ```jsonc
 {
   "input": "Text to speak (required)",
-  "model": "auto",            // or "edge" / "qwen3-0.6b" / "styletts2-uk" / ...
+  "model": "auto",            // or "edge" / "qwen3-0.6b" / "qwen3-1.7b" / "styletts2-uk" / ...
   "language": "en-US",        // BCP-47
   "voice": "en-US-AriaNeural",// or "ref:<id>" for cloning, or null for default
   "speed": 1.0,               // 0.25–4.0, 1.0 = native
-  "response_format": "wav",   // "wav" | "mp3"
-  "sample_rate": null,        // optional, 8000–48000
+  "response_format": "wav",   // "wav" (default, lossless) | "mp3"
+  "sample_rate": 24000,       // 8000–48000, default 24000 = providers' native rate
   "idempotency_key": null     // optional; when set, bypasses the content hash
 }
 ```
+
+Defaults (omit a field to take its default):
+
+| Field | Default | Why |
+|---|---|---|
+| `model` | `"auto"` | Route by `language` (see `[routing.by_language]`) |
+| `speed` | `1.0` | Native cadence |
+| `response_format` | `"wav"` | Lossless — no codec noise |
+| `sample_rate` | `24000` | Matches every shipped provider's native rate; no resampling on the hot path |
+
+### Audio quality and sample rate
+
+Every provider in this repo (`fake`, `edge`, `qwen3-0.6b`, `qwen3-1.7b`,
+`styletts2-uk`) emits audio at **24 000 Hz mono**. That's the ceiling of
+information the model actually produces — anything higher in the API is
+just upsampling.
+
+| `sample_rate` | What happens | When to use |
+|---|---|---|
+| `8000` – `16000` | Downsample via ffmpeg. Audible loss of high frequencies. | Telephone-grade, very small files |
+| `22050` | Slight downsample. Almost transparent on speech. | Compromise size vs quality |
+| **`24000`** (default) | No resampling. Whatever the model produced, you get. | Max fidelity, fastest |
+| `32000` – `48000` | Upsample via ffmpeg. **Pure interpolation — no extra fidelity from the model**. Bigger files, identical perceptual quality. | Pipeline that demands 48 kHz |
+
+> **Note on Qwen model naming.** `Qwen3-TTS-12Hz-1.7B-Base` mentions
+> `12Hz` — that's the **codec frame rate** (audio tokens per second
+> before the vocoder), **not** the audio sample rate. The decoded
+> waveform is 24 kHz.
+
+What actually moves the needle on perceptual quality:
+
+1. **Model size** — `qwen3-1.7b` consistently beats `qwen3-0.6b` on WER (~7-15 % lower) at ~3x VRAM. Use `1.7b` when you have the budget.
+2. **`response_format: "wav"`** — keeps the model's full output. `mp3` adds codec noise; OK for delivery but not for downstream processing.
+3. **Reference audio quality** (voice cloning only) — a clean 5-15 s mono clip of the target speaker, sample-rate ≥ 16 kHz, no music/reverb. The closer the ref-audio matches your desired output style, the better.
+4. **`ref_text` exactly matches the reference audio**, word-for-word. Qwen conditions on the (audio, text) pair; mismatched text causes hallucinated phonemes.
 
 ### Voice cloning
 

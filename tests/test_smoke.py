@@ -64,6 +64,30 @@ def test_speech_returns_wav(client) -> None:
     assert r.content[8:12] == b"WAVE"
 
 
+def test_speech_defaults_to_wav_24khz(client) -> None:
+    """Omitting response_format/sample_rate yields wav at 24 kHz (max fidelity)."""
+    r = client.post(
+        "/v1/audio/speech",
+        json={"input": "hello world", "model": "fake", "language": "en", "voice": "fake-en"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.headers["content-type"] == "audio/wav"
+    assert r.headers["x-audio-format"] == "wav"
+    assert r.headers["x-sample-rate"] == "24000"
+
+
+def test_speech_rejects_sample_rate_below_8khz(client) -> None:
+    """sample_rate is bounded to a sensible audio range."""
+    r = client.post(
+        "/v1/audio/speech",
+        json={
+            "input": "hi", "model": "fake", "language": "en", "voice": "fake-en",
+            "sample_rate": 4000,
+        },
+    )
+    assert r.status_code == 422  # pydantic validation
+
+
 def test_speech_envelope_json(client) -> None:
     r = client.post(
         "/v1/audio/speech?envelope=json",
