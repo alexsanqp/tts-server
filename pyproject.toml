@@ -1,0 +1,75 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tts-server"
+version = "0.1.0"
+description = "Self-hosted pluggable TTS HTTP service"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "python-multipart>=0.0.17",
+    "httpx>=0.28",
+]
+
+[project.optional-dependencies]
+edge = ["edge-tts>=6.1", "langcodes>=3.4"]
+qwen = ["qwen-tts>=0.1.1", "soundfile>=0.12", "torch>=2.3"]
+# StyleTTS2 deps include three GitHub-only packages (not on PyPI).
+# Requires `pip install -e ".[styletts2]"` (hatchling needs allow-direct-references).
+styletts2 = [
+    "torch>=2.2",
+    "torchaudio>=2.2",
+    "soundfile>=0.12",
+    "librosa>=0.10",
+    "einops",
+    "einops_exts",
+    "munch",
+    "pyyaml",
+    "transformers>=4.40",
+    "numpy<2",
+    "num2words>=0.5",
+    "truststore>=0.10",
+    "ukrainian-word-stress @ git+https://github.com/patriotyk/ukrainian-word-stress.git",
+    "ipa-uk @ git+https://github.com/patriotyk/ipa-uk.git",
+    "styletts2-inference @ git+https://github.com/patriotyk/styletts2-inference.git",
+]
+all = ["tts-server[edge,qwen,styletts2]"]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.7",
+]
+
+[project.scripts]
+tts-server = "tts_server.__main__:main"
+
+[tool.hatch.metadata]
+# styletts2 extra pulls deps straight from GitHub (upstream isn't on PyPI).
+# Hatchling forbids direct refs by default; this opts them in.
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tts_server"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "gpu: requires CUDA + provider weights",
+    "network: requires outbound network access",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "ASYNC"]
+ignore = ["E501"]

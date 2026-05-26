@@ -1,0 +1,60 @@
+[server]
+host = "0.0.0.0"
+port = 8880
+# Set a token to enable bearer auth. Empty disables auth on all endpoints
+# EXCEPT /v1/refs (which always requires auth — uploads are the only write surface).
+auth_token = ""
+request_timeout_seconds = 300
+max_queue_depth = 32
+
+[refs]
+catalog_dir = "data/refs-catalog"
+upload_dir  = "data/refs"
+upload_ttl_hours = 24
+max_upload_mb = 10
+
+[cache]
+enabled = true
+max_entries = 256
+
+[providers]
+# Enable additional providers by uncommenting after installing the matching extra:
+#   pip install -e ".[edge]"       -> edge
+#   pip install -e ".[qwen]"       -> qwen3-0.6b
+#   pip install -e ".[styletts2]"  -> styletts2-uk
+enabled  = ["fake", "edge", "qwen3-0.6b", "styletts2-uk"]
+# A required provider whose load fails makes /readyz report 503.
+required = []
+
+[providers.fake]
+default_voice = "fake-en"
+
+[providers.edge]
+default_voice = "en-US-AriaNeural"
+
+[providers.qwen3-0.6b]
+port = 8890
+host = "127.0.0.1"
+ref_audio_dir = "data/refs-catalog"
+model_name = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+device = "cuda:0"
+startup_timeout_seconds = 180
+
+[providers.styletts2-uk]
+default_voice = "Марина Панас"
+
+[routing]
+default = "fake"
+
+[routing.by_language]
+en = "qwen3-0.6b"
+uk = "styletts2-uk"
+de = "qwen3-0.6b"
+fr = "qwen3-0.6b"
+es = "qwen3-0.6b"
+ru = "qwen3-0.6b"
+it = "qwen3-0.6b"
+zh = "qwen3-0.6b"
+ja = "qwen3-0.6b"
+ko = "qwen3-0.6b"
+pt = "qwen3-0.6b"
