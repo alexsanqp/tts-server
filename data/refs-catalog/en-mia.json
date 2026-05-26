@@ -1,8 +1,0 @@
-{
-  "ref_text": "Okay, I have to tell you about the most amazing thing that happened to me last weekend! I was just walking through the park, totally minding my own business, and you would not believe what I saw right there in front of me.",
-  "language": "en",
-  "gender": "female",
-  "description": "Primary English female voice. Energetic, clear, bubbly millennial tone. Brings momentum to introductions and enthusiastic announcements. Pairs with Owen for cross-gender variety on the channel.",
-  "role": "host",
-  "notes": "Save the generated sample as en-mia.mp3 or en-mia.wav alongside this file. If you regenerate with different text, update `ref_text` to match the new transcript exactly (word for word, including punctuation)."
-}

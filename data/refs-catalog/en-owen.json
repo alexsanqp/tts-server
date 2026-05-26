@@ -1,8 +1,0 @@
-{
-  "ref_text": "Imagine waking up early on a quiet Sunday morning, with the sun just starting to rise above the city. The air is fresh, the streets are still empty, and the whole day stretches out ahead of you, full of possibility.",
-  "language": "en",
-  "gender": "male",
-  "description": "Primary English male voice. Clear, positive, inspiring delivery. Adult American male, storyteller cadence. Best for intros, narration, lead-in moments, and any segment that needs a confident, welcoming tone.",
-  "role": "host",
-  "notes": "Save the generated sample as en-owen.mp3 or en-owen.wav alongside this file. If you regenerate with different text, update `ref_text` to match the new transcript exactly (word for word, including punctuation)."
-}

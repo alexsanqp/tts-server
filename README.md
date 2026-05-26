@@ -164,16 +164,23 @@ For providers that support cloning (today: Qwen3-TTS):
 2. Use that id as `"voice": "ref:abc123…"` in subsequent synthesis requests.
 3. Uploads are kept for `refs.upload_ttl_hours` (default 24h), then swept.
 
-#### Curated catalog (committed voices)
+#### Local catalog (operator-supplied voices)
 
-Stable voices ship under `data/refs-catalog/` with this layout:
+`data/refs-catalog/` is where each deployment drops its own reference
+clips. **Nothing audio-shaped ships in this repo** — voices and their
+metadata are operator-specific (and may carry licensing constraints), so
+the directory is gitignored apart from a single `example.json` schema
+template.
+
+Drop your files in with this layout:
 
 ```
 data/refs-catalog/
-├── en-owen.mp3       ← 5-15 s clean speech, one speaker
-├── en-owen.json      ← sidecar metadata (see below)
-├── en-mia.mp3
-├── en-mia.json
+├── example.json                ← schema reference, committed
+├── <lang>-<name>.mp3           ← 5-15 s clean speech, one speaker
+├── <lang>-<name>.json          ← sidecar metadata (same stem)
+├── <lang>.mp3                  ← optional default-per-language form
+├── <lang>.json
 └── ...
 ```
 
@@ -181,7 +188,7 @@ Filename schema:
 
 | Pattern | Resulting voice id | Use for |
 |---|---|---|
-| `<lang>-<name>.{mp3,wav}` | `ref:<lang>-<name>` | Named voices (Owen, Mia, …) |
+| `<lang>-<name>.{mp3,wav}` | `ref:<lang>-<name>` | Named voices |
 | `<lang>.{mp3,wav}` | `ref:<lang>-default` | One default voice per language |
 
 `<lang>` must be a Qwen-supported BCP-47 primary tag (`en, de, fr, it, es,
@@ -190,13 +197,15 @@ disk for future providers (XTTS, Coqui) that may use it.
 
 #### Sidecar `.json` schema
 
-Each audio file pairs with `<stem>.json`:
+Each audio file pairs with `<stem>.json` — see
+[`data/refs-catalog/example.json`](data/refs-catalog/example.json) for a
+working template:
 
 ```json
 {
-  "ref_text": "Exact transcript of the audio, word for word.",
+  "ref_text": "Exact transcript of the reference audio, word for word.",
   "gender": "male",
-  "description": "Primary English host. Clear, inspiring delivery.",
+  "description": "Free-text label, surfaced via /v1/voices.",
   "role": "host"
 }
 ```
@@ -212,6 +221,11 @@ If the sidecar is missing or `ref_text` is empty, the caller must pass
 `ref_text` in the synthesis request body. Plain-stem files (e.g. `en.mp3`)
 fall back to a built-in default text — handy for quick demos, not for
 production.
+
+> **Sourcing voices:** any clean recording of a single speaker works. Public
+> domain catalogues (LibriVox), permissively licensed datasets (Common
+> Voice), or your own recordings are all fine. Make sure the licence of
+> your source permits use as a TTS conditioning signal before you ship.
 
 ## Configuration
 

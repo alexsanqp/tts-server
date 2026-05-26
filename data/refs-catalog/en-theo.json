@@ -1,8 +1,0 @@
-{
-  "ref_text": "I've always found that the best ideas tend to arrive when you least expect them. You'll be walking down a street, or pouring a cup of coffee, and suddenly the answer just appears in your mind, quietly, as if it had been waiting all along.",
-  "language": "en",
-  "gender": "male",
-  "description": "Secondary English male voice. Genuine, steady, deep. Young storyteller tone — pairs with Owen for cross-voice variety. Best for reflective passages, explanations, and calm follow-up commentary.",
-  "role": "sidekick",
-  "notes": "Save the generated sample as en-theo.mp3 or en-theo.wav alongside this file. If you regenerate with different text, update `ref_text` to match the new transcript exactly (word for word, including punctuation)."
-}

@@ -19,13 +19,15 @@ data/*.opus
 data/*.tmp
 !data/refs-catalog/
 
-# Reference-audio binaries are operator-specific (may carry licensing
-# constraints from third-party TTS platforms). JSON sidecars stay tracked
-# as schema documentation; audio is provided by each deployment.
+# Reference-audio catalog is operator-specific — each deployment supplies
+# its own voices and metadata. Only `example.json` ships as a schema
+# template; everything else stays local.
 data/refs-catalog/*.mp3
 data/refs-catalog/*.wav
 data/refs-catalog/*.flac
 data/refs-catalog/*.ogg
+data/refs-catalog/*.json
+!data/refs-catalog/example.json
 
 cache/
 *.log

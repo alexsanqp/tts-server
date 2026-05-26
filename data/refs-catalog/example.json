@@ -1,0 +1,7 @@
+{
+  "ref_text": "Exact transcript of the reference audio, word for word, including punctuation. Qwen3-TTS conditions on both the audio and this text — a mismatch produces broken or hallucinated output.",
+  "gender": "male",
+  "description": "Free-text label surfaced via /v1/voices for client-side filtering.",
+  "role": "host",
+  "notes": "Place a 5-15 s clean recording of a single speaker at <same-stem>.mp3 (or .wav). Filename schema: `<lang>-<name>.{mp3,wav,json}` produces ref id `ref:<lang>-<name>`; a plain `<lang>.{mp3,wav,json}` produces `ref:<lang>-default`. `<lang>` must be a Qwen-supported BCP-47 primary tag."
+}
