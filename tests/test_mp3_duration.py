@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import shutil
 import struct
 import wave
 
 import pytest
 
+from tts_server.core.transcode import ffmpeg_available
 from tts_server.providers.edge import _mp3_duration_ms
 
 
@@ -28,7 +28,7 @@ def test_id3v2_only_returns_zero() -> None:
 
 
 @pytest.mark.skipif(
-    shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH"
+    not ffmpeg_available(), reason="ffmpeg not available (missing or exec-blocked)"
 )
 async def test_matches_ffmpeg_within_50ms() -> None:
     """End-to-end: silence WAV → MP3 via ffmpeg → parsed duration ≈ original."""

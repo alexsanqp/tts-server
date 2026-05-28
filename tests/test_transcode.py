@@ -62,6 +62,20 @@ async def test_invalid_format_raises() -> None:
         await transcode(audio=b"x", source_format="nope", target_format="wav")
 
 
+async def test_spawn_oserror_maps_to_unavailable(monkeypatch) -> None:
+    """If the OS refuses to launch ffmpeg (e.g. Windows WDAC / WinError 4551),
+    surface TranscoderUnavailable (→ 422) instead of a bare OSError/500."""
+    async def _boom(*args, **kwargs):
+        raise OSError(4551, "An Application Control policy has blocked this file")
+
+    monkeypatch.setattr(
+        "tts_server.core.transcode.asyncio.create_subprocess_exec", _boom
+    )
+    src = _silence_wav(duration_ms=50)
+    with pytest.raises(TranscoderUnavailable):
+        await transcode(audio=src, source_format="wav", target_format="mp3")
+
+
 async def test_wav_output_has_clean_header_after_ffmpeg() -> None:
     """ffmpeg-via-pipe usually leaves bogus chunk sizes + LIST metadata.
 

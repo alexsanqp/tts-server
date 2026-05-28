@@ -13,8 +13,10 @@ The WAV header repair (after ffmpeg) lives in :mod:`tts_server.core.wav`.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import shutil
+import subprocess
 from dataclasses import dataclass
 
 from tts_server.core.wav import normalize_wav
@@ -38,11 +40,34 @@ class TranscoderError(Exception):
 
 
 class TranscoderUnavailable(Exception):
-    """ffmpeg is not on PATH."""
+    """ffmpeg is missing from PATH or present-but-not-executable."""
 
 
+@functools.lru_cache(maxsize=1)
 def ffmpeg_available() -> bool:
-    return shutil.which("ffmpeg") is not None
+    """True iff ffmpeg is on PATH AND can actually be executed.
+
+    ``shutil.which`` only confirms the file exists — on Windows an
+    Application Control / Smart App Control policy can still block
+    execution (WinError 4551), and a corrupt binary fails at exec too.
+    A real ``ffmpeg -version`` probe gives callers an honest answer so
+    :func:`transcode` returns a clean 422 instead of a generic 500, and
+    the ffmpeg-gated tests skip correctly on locked-down machines.
+
+    Cached: ffmpeg availability is stable for the life of the process.
+    """
+    path = shutil.which("ffmpeg")
+    if path is None:
+        return False
+    try:
+        result = subprocess.run(
+            [path, "-version"],
+            capture_output=True,
+            timeout=5,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 async def transcode(
@@ -71,7 +96,11 @@ async def transcode(
 
     if not ffmpeg_available():
         raise TranscoderUnavailable(
-            "ffmpeg is required for response_format transcoding but is not on PATH"
+            "ffmpeg is required for response_format transcoding but is "
+            "unavailable (missing from PATH, or present-but-not-executable — "
+            "e.g. blocked by a Windows Application Control policy). Request "
+            "response_format matching the provider's native format to skip "
+            "transcoding: mp3 for edge, wav for qwen/styletts2."
         )
 
     args = [
@@ -88,12 +117,27 @@ async def transcode(
     # Output codec; ffmpeg picks sensible defaults per container.
     args += ["-f", tgt, "pipe:1"]
 
-    proc = await asyncio.create_subprocess_exec(
-        *args,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as exc:
+        # ffmpeg is on PATH (ffmpeg_available() passed) but the OS refused
+        # to launch it: e.g. Windows Application Control / Smart App Control
+        # blocking an unsigned build (WinError 4551), a permission error, or
+        # a corrupt binary. Surface as Unavailable (→ 422) with actionable
+        # guidance rather than letting a bare OSError become a generic 500.
+        raise TranscoderUnavailable(
+            f"ffmpeg is on PATH but could not be executed ({exc}). "
+            "On Windows this is usually an Application Control / Smart App "
+            "Control policy blocking an unsigned ffmpeg build. Either "
+            "allowlist a signed ffmpeg, or request response_format matching "
+            "the provider's native format (e.g. mp3 for edge, wav for "
+            "qwen/styletts2) to skip transcoding entirely."
+        ) from exc
     try:
         out, err = await asyncio.wait_for(proc.communicate(audio), timeout=timeout)
     except asyncio.TimeoutError:
