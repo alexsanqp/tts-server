@@ -610,6 +610,70 @@ async def test_synthesize_returns_wav_stream_with_parsed_metadata(tmp_path) -> N
     assert sent == {"text": "hi", "language": "en"}
 
 
+async def test_synthesize_self_heals_when_sidecar_dies(tmp_path, monkeypatch) -> None:
+    """If the sidecar was killed out-of-band, the first POST gets a
+    ConnectError. The provider should detect that the worker is dead,
+    re-spawn it via load(), and transparently retry the request once."""
+    provider = QwenProvider(options={"ref_audio_dir": str(tmp_path), "port": 9999})
+    wav_bytes = _make_wav(sample_rate=24000, n_samples=24000)
+
+    success_resp = _FakeResponse(
+        status_code=200,
+        content=wav_bytes,
+        headers={"x-sample-rate": "24000", "content-type": "audio/wav"},
+    )
+    # First POST trips ConnectError; the retry after recovery succeeds.
+    fake_client = _FakeClient(
+        post_responses=[httpx.ConnectError("refused"), success_resp]
+    )
+
+    # Health probe reports dead → recovery branch is taken.
+    health_calls: list[int] = []
+    async def fake_is_healthy(self_: QwenProvider) -> bool:
+        health_calls.append(1)
+        return False
+    monkeypatch.setattr(QwenProvider, "_is_healthy", fake_is_healthy)
+
+    # Pretend the respawn succeeded without touching subprocess.Popen.
+    load_calls: list[int] = []
+    async def fake_load(self_: QwenProvider) -> None:
+        load_calls.append(1)
+    monkeypatch.setattr(QwenProvider, "load", fake_load)
+
+    with _patch_async_client([fake_client]):
+        stream = await provider.synthesize(_make_request(text="hi", language="en"))
+
+    body = await _drain(stream)
+    assert body == wav_bytes
+    assert len(fake_client.post_calls) == 2, "initial POST + one retry expected"
+    assert len(health_calls) == 1, "exactly one health probe between attempts"
+    assert len(load_calls) == 1, "load() should be invoked once to respawn"
+
+
+async def test_synthesize_does_not_retry_when_sidecar_still_healthy(tmp_path, monkeypatch) -> None:
+    """A ConnectError with a still-healthy sidecar is a transient blip on
+    a live connection (rare but possible). Don't pay the respawn cost —
+    just propagate the original error."""
+    provider = QwenProvider(options={"ref_audio_dir": str(tmp_path), "port": 9999})
+    fake_client = _FakeClient(post_responses=[httpx.ConnectError("transient")])
+
+    async def fake_is_healthy(self_: QwenProvider) -> bool:
+        return True
+    monkeypatch.setattr(QwenProvider, "_is_healthy", fake_is_healthy)
+
+    load_calls: list[int] = []
+    async def fake_load(self_: QwenProvider) -> None:
+        load_calls.append(1)
+    monkeypatch.setattr(QwenProvider, "load", fake_load)
+
+    with _patch_async_client([fake_client]):
+        with pytest.raises(ProviderUnavailable):
+            await provider.synthesize(_make_request(text="hi", language="en"))
+
+    assert len(fake_client.post_calls) == 1, "no retry when sidecar is healthy"
+    assert len(load_calls) == 0, "load() must not be invoked unnecessarily"
+
+
 async def test_synthesize_forwards_clone_ref_and_ref_text(tmp_path) -> None:
     provider = QwenProvider(options={"ref_audio_dir": str(tmp_path)})
     wav_bytes = _make_wav()
@@ -678,13 +742,27 @@ async def test_synthesize_raises_provider_failure_on_sidecar_5xx(tmp_path) -> No
             await provider.synthesize(_make_request())
 
 
-async def test_synthesize_raises_provider_unavailable_on_network_error(tmp_path) -> None:
+async def test_synthesize_raises_provider_unavailable_when_retry_also_fails(tmp_path, monkeypatch) -> None:
+    """Sidecar dies, respawn 'succeeds' (mock), but the retry POST also
+    hits ConnectError → original error mode (ProviderUnavailable) survives
+    so the API layer can return a clean 503."""
     provider = QwenProvider(options={"ref_audio_dir": str(tmp_path)})
-    fake_client = _FakeClient(post_responses=[httpx.ConnectError("refused")])
+    fake_client = _FakeClient(
+        post_responses=[httpx.ConnectError("refused"), httpx.ConnectError("still refused")]
+    )
+
+    async def fake_is_healthy(self_: QwenProvider) -> bool:
+        return False  # sidecar dead → recovery branch
+    monkeypatch.setattr(QwenProvider, "_is_healthy", fake_is_healthy)
+
+    async def fake_load(self_: QwenProvider) -> None:
+        return  # pretend respawn worked
+    monkeypatch.setattr(QwenProvider, "load", fake_load)
 
     with _patch_async_client([fake_client]):
         with pytest.raises(ProviderUnavailable, match="request failed"):
             await provider.synthesize(_make_request())
+    assert len(fake_client.post_calls) == 2, "must attempt the retry"
 
 
 # ---------------------------------------------------------------------------

@@ -404,8 +404,7 @@ class QwenProvider:
 
         url = f"http://{self._host}:{self._port}/synthesize"
         try:
-            async with httpx.AsyncClient(timeout=self._request_timeout) as client:
-                resp = await client.post(url, json=payload)
+            resp = await self._post_with_self_healing(url, payload)
         except httpx.HTTPError as exc:
             raise ProviderUnavailable(
                 f"Qwen sidecar request failed: {type(exc).__name__}: {exc}"
@@ -436,6 +435,45 @@ class QwenProvider:
     @property
     def _health_url(self) -> str:
         return f"http://{self._host}:{self._port}/health"
+
+    async def _post_with_self_healing(
+        self, url: str, payload: dict[str, Any]
+    ) -> httpx.Response:
+        """POST to the sidecar; respawn it once and retry if it's dead.
+
+        When the sidecar process gets killed out-of-band (operator kill,
+        OOM, parent-shell shutdown), the registry's ``entry.loaded`` flag
+        stays ``True`` and ``load()``'s health pre-check would normally
+        not run — so subsequent requests would hammer a dead port forever
+        and return 503. Catching the connection error here, checking
+        whether the worker is actually alive, and spawning a fresh one
+        before retrying once turns that wedged state into a one-time
+        cold-start delay.
+        """
+        async with httpx.AsyncClient(timeout=self._request_timeout) as client:
+            try:
+                return await client.post(url, json=payload)
+            except httpx.HTTPError as first_exc:
+                # Only respawn for connection-class failures; protocol-level
+                # errors (timeouts, decode) almost certainly mean a live
+                # sidecar is misbehaving — don't compound the problem.
+                if not isinstance(first_exc, (httpx.ConnectError, httpx.ReadError)):
+                    raise
+                if await self._is_healthy():
+                    # Sidecar is up but the request still failed — propagate.
+                    raise
+                logger.warning(
+                    "Qwen sidecar at %s:%d unreachable; respawning before retry",
+                    self._host, self._port,
+                )
+                # Reap the dead subprocess handle so load() spawns a new one.
+                self._proc = None
+                try:
+                    await self.load()
+                except ProviderUnavailable:
+                    raise  # spawning failed too — caller gets a clean error
+                # One retry; if this also fails, propagate the new error.
+                return await client.post(url, json=payload)
 
 
 # Variant → expected peak free VRAM (MiB). Used only for the warning in
